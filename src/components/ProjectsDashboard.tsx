@@ -553,7 +553,16 @@ export const ProjectsDashboard: React.FC<ProjectsDashboardProps> = ({
                       >
                         <div className="space-y-2">
                           <div className="relative aspect-video overflow-hidden rounded-md bg-slate-900">
-                            {clip.thumbnailUrl ? (
+                            {clip.exportedUrl ? (
+                              <video
+                                src={clip.exportedUrl}
+                                poster={clip.thumbnailUrl ?? undefined}
+                                controls
+                                preload="metadata"
+                                playsInline
+                                className="h-full w-full object-contain bg-black"
+                              />
+                            ) : clip.thumbnailUrl ? (
                               <img
                                 src={clip.thumbnailUrl}
                                 alt={clip.title}
@@ -565,9 +574,11 @@ export const ProjectsDashboard: React.FC<ProjectsDashboardProps> = ({
                                 <Film className="h-6 w-6 text-slate-600" />
                               </div>
                             )}
-                            <span className="absolute bottom-1.5 right-2 font-mono text-[11px] font-medium text-white bg-black/70 px-1.5 py-0.5 rounded tabular-nums">
-                              {formatTimecode(clip.endTime - clip.startTime)}
-                            </span>
+                            {!clip.exportedUrl && (
+                              <span className="absolute bottom-1.5 right-2 font-mono text-[11px] font-medium text-white bg-black/70 px-1.5 py-0.5 rounded tabular-nums">
+                                {formatTimecode(clip.endTime - clip.startTime)}
+                              </span>
+                            )}
                           </div>
                           <h4 className="text-sm font-semibold text-slate-900 dark:text-white line-clamp-2">
                             {clip.title}

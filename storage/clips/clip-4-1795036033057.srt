@@ -1,0 +1,11 @@
+1
+00:00:00,000 --> 00:00:06,000
+Por qué fracasan los prototipos caros? Porque queman tokens antes de filtrar los mejores momentos.
+
+2
+00:00:06,000 --> 00:00:12,000
+La arquitectura ganadora usa una rúbrica determinista de 100 puntos antes de llamar al modelo.
+
+3
+00:00:12,000 --> 00:00:18,500
+Paso uno: extraer audio ligero y transcribir con marcas de tiempo exactas para cada frase.

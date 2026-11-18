@@ -111,21 +111,29 @@ export function App() {
     void fetchWorkspace();
   }, [fetchWorkspace]);
 
+  const trackedJob =
+    trackedJobId !== null ? jobs.find((j) => j.id === trackedJobId) ?? null : null;
+
+  const isTrackedJobActive =
+    trackedJobId !== null &&
+    (!trackedJob ||
+      (trackedJob.stage !== 'completed' &&
+        trackedJob.stage !== 'failed' &&
+        trackedJob.stage !== 'interrupted'));
+
   const hasProcessingVideos = videos.some((v) => v.status === 'processing');
   useEffect(() => {
-    if (!hasProcessingVideos) return;
+    if (!hasProcessingVideos && !isTrackedJobActive) return;
     const timer = setInterval(() => {
       void fetchWorkspace();
     }, 1000);
     return () => clearInterval(timer);
-  }, [hasProcessingVideos, fetchWorkspace]);
-
-  const trackedJob =
-    trackedJobId !== null ? jobs.find((j) => j.id === trackedJobId) ?? null : null;
+  }, [hasProcessingVideos, isTrackedJobActive, fetchWorkspace]);
 
   const handleVideoCreated = (videoId: number, job: ProcessingJob) => {
     setSelectedVideoId(videoId);
     setTrackedJobId(job.id);
+    setJobs((prev) => (prev.some((j) => j.id === job.id) ? prev : [...prev, job]));
     void fetchWorkspace();
   };
 
@@ -369,10 +377,16 @@ export function App() {
         isOpen={uploadModalOpen}
         onClose={() => setUploadModalOpen(false)}
         projects={projects}
+        clips={clips}
         geminiConfigured={systemStatus?.geminiConfigured ?? false}
         maxUploadSizeBytes={systemStatus?.maxUploadSizeBytes}
         objectStorageConfigured={systemStatus?.objectStorageConfigured ?? false}
         onVideoCreated={handleVideoCreated}
+        onOpenStudio={(videoId, clipId) => {
+          setUploadModalOpen(false);
+          handleOpenStudio(videoId, clipId);
+        }}
+        onRetryVideo={handleRetryVideo}
         activeJob={trackedJob}
         lang={lang}
       />

@@ -21,6 +21,7 @@ import {
   refineCandidatesWithGemini,
   transcribeAudioWithGemini,
 } from './processing/geminiClient';
+import { renderClipWithFfmpeg } from './processing/renderer';
 import {
   analyzeVideo,
   detectSceneChanges,
@@ -195,8 +196,8 @@ export async function runVideoPipeline(params: {
         }
       }
 
-      // Stage 5: Generate per-clip preview thumbnails & persist atomically
-      await updateJob(jobId, 'generating_thumbnails', 90, 'Generating candidate clip thumbnails...');
+      // Stage 5: Generate per-clip preview thumbnails & render real playable MP4 clips
+      await updateJob(jobId, 'generating_thumbnails', 86, 'Generating clip thumbnails & preparing cuts...');
 
       const thumbUrls: Array<string | null> = [];
       const clipIds: number[] = [];
@@ -218,6 +219,7 @@ export async function runVideoPipeline(params: {
         thumbUrls.push(thumb);
       }
 
+      const createdClips: ClipRecord[] = [];
       await mutateDb((db) => {
         for (let i = 0; i < candidates.length; i++) {
           const cand = candidates[i];
@@ -248,8 +250,47 @@ export async function runVideoPipeline(params: {
             createdAt: new Date().toISOString(),
           };
           db.clips.push(newClip);
+          createdClips.push(newClip);
         }
+      });
 
+      let renderedCount = 0;
+      for (let i = 0; i < createdClips.length; i++) {
+        const clip = createdClips[i];
+        const pct = 88 + Math.round(((i + 0.5) / Math.max(1, createdClips.length)) * 11);
+        await updateJob(
+          jobId,
+          'generating_thumbnails',
+          pct,
+          `Cutting & rendering real MP4 clip ${i + 1}/${createdClips.length}...`
+        );
+        try {
+          const rendered = await renderClipWithFfmpeg({
+            clip,
+            videoPath,
+            hasAudio: meta.hasAudio,
+            segments,
+          });
+          renderedCount++;
+          await mutateDb((db) => {
+            const target = db.clips.find((c) => c.id === clip.id);
+            if (target) {
+              target.exportedUrl = rendered.exportedUrl;
+              target.srtUrl = rendered.srtUrl;
+              target.exportedSizeBytes = rendered.exportedSizeBytes;
+              if (rendered.thumbnailUrl) target.thumbnailUrl = rendered.thumbnailUrl;
+              target.status = i === 0 ? 'approved' : 'exported';
+            }
+          });
+        } catch (renderErr) {
+          console.warn(
+            `[ClipForge] Failed auto-rendering clip ${clip.id}:`,
+            renderErr instanceof Error ? renderErr.message : renderErr
+          );
+        }
+      }
+
+      await mutateDb((db) => {
         const finalVideo = db.videos.find((v) => v.id === videoId);
         if (finalVideo) {
           finalVideo.status = 'ready';
@@ -261,7 +302,7 @@ export async function runVideoPipeline(params: {
         jobId,
         'completed',
         100,
-        `Pipeline complete: ${candidates.length} clips detected.${fallbackNote}`
+        `Pipeline complete: ${renderedCount}/${createdClips.length} real MP4 clips created & ready.${fallbackNote}`
       );
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unexpected processing error';

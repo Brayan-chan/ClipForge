@@ -1,9 +1,11 @@
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
+import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { createServer as createViteServer } from 'vite';
 import type { ClipRecord, ScoringConfig, TranscriptSegment } from './src/types';
 import {
@@ -131,6 +133,7 @@ interface ChunkUploadSession {
   tempPath: string;
   expectedSizeBytes: number;
   receivedBytes: number;
+  chunkSizes: Map<number, number>;
   title: string;
   projectId: number;
   useAi: boolean;
@@ -209,18 +212,6 @@ async function finalizeUploadedVideo(params: {
     db.processingJobs.push(j);
     return { video: v, job: j };
   });
-
-  const thumbUrl = await generateThumbnail(
-    params.filePath,
-    `video-${video.id}-cover.jpg`,
-    Math.min(2, Math.max(0.2, videoMeta.duration * 0.15))
-  );
-  if (thumbUrl) {
-    await mutateDb((db) => {
-      const target = db.videos.find((item) => item.id === video.id);
-      if (target) target.thumbnailUrl = thumbUrl;
-    });
-  }
 
   void runVideoPipeline({
     videoId: video.id,
@@ -464,6 +455,7 @@ app.post('/api/videos/upload/init', (req, res) => {
     tempPath,
     expectedSizeBytes: sizeBytes,
     receivedBytes: 0,
+    chunkSizes: new Map<number, number>(),
     title:
       (title ?? '').trim().slice(0, 120) ||
       path.basename(filename).replace(/\.[^.]+$/, ''),
@@ -475,7 +467,11 @@ app.post('/api/videos/upload/init', (req, res) => {
     writeChain: Promise.resolve(),
   });
 
-  res.status(201).json({ uploadId, chunkSizeBytes: UPLOAD_CHUNK_BYTES });
+  res.status(201).json({
+    uploadId,
+    chunkSizeBytes: UPLOAD_CHUNK_BYTES,
+    concurrency: 3,
+  });
 });
 
 app.post(
@@ -494,7 +490,26 @@ app.post(
       return;
     }
 
-    if (session.receivedBytes + chunk.length > MAX_VIDEO_SIZE_BYTES) {
+    const rawIndex = req.query.index ?? req.headers['x-chunk-index'];
+    const rawOffset = req.query.offset ?? req.headers['x-chunk-offset'];
+    const hasPositionalArgs = rawIndex !== undefined && rawOffset !== undefined;
+    const chunkIndex = hasPositionalArgs ? Number(rawIndex) : -1;
+    const chunkOffset = hasPositionalArgs ? Number(rawOffset) : -1;
+
+    if (
+      hasPositionalArgs &&
+      (!Number.isInteger(chunkIndex) ||
+        chunkIndex < 0 ||
+        !Number.isInteger(chunkOffset) ||
+        chunkOffset < 0 ||
+        chunkOffset + chunk.length > session.expectedSizeBytes ||
+        chunkOffset + chunk.length > MAX_VIDEO_SIZE_BYTES)
+    ) {
+      res.status(400).json({ error: 'Invalid chunk index or byte offset.' });
+      return;
+    }
+
+    if (!hasPositionalArgs && session.receivedBytes + chunk.length > MAX_VIDEO_SIZE_BYTES) {
       safeUnlink(session.tempPath);
       chunkUploadSessions.delete(session.uploadId);
       res.status(400).json({
@@ -505,8 +520,24 @@ app.post(
 
     try {
       session.writeChain = session.writeChain.then(async () => {
-        await fs.promises.appendFile(session.tempPath, chunk);
-        session.receivedBytes += chunk.length;
+        if (hasPositionalArgs) {
+          const handle = await fs.promises.open(
+            session.tempPath,
+            fs.existsSync(session.tempPath) ? 'r+' : 'w+'
+          );
+          try {
+            await handle.write(chunk, 0, chunk.length, chunkOffset);
+          } finally {
+            await handle.close();
+          }
+          session.chunkSizes.set(chunkIndex, chunk.length);
+          let sum = 0;
+          for (const sz of session.chunkSizes.values()) sum += sz;
+          session.receivedBytes = sum;
+        } else {
+          await fs.promises.appendFile(session.tempPath, chunk);
+          session.receivedBytes += chunk.length;
+        }
         session.lastActivityMs = Date.now();
       });
       await session.writeChain;
@@ -969,6 +1000,120 @@ app.get('/api/jobs/:videoId', (req, res) => {
   res.json({ job: latest });
 });
 
+const execFileAsync = promisify(execFile);
+const PREVIEWS_DIR = path.join(STORAGE_ROOT, 'previews');
+const activePreviewJobs = new Map<string, Promise<void>>();
+
+app.get('/api/videos/:id/preview', async (req, res) => {
+  const videoId = Number(req.params.id);
+  const format = req.query.format === 'webm' ? 'webm' : 'mp4';
+  const db = readDb();
+  const video = db.videos.find((v) => v.id === videoId);
+  if (!video) {
+    res.status(404).json({ error: 'Video not found' });
+    return;
+  }
+
+  const videoPath = resolveVideoInputSource(video);
+  if (!videoPath.startsWith('http') && !fs.existsSync(videoPath)) {
+    res.status(404).json({ error: 'Source video file is missing on disk.' });
+    return;
+  }
+
+  const rawStart = Number(req.query.start);
+  const rawEnd = Number(req.query.end);
+  const hasWindow = Number.isFinite(rawStart) || Number.isFinite(rawEnd);
+  const totalDur = Math.max(1, video.duration || 60);
+  const winStart = Number.isFinite(rawStart)
+    ? Math.max(0, Math.min(totalDur - 1, Math.floor(rawStart)))
+    : 0;
+  // Cap any single transcode slice to 75 seconds so long videos respond in ~2-4s instead of timing out
+  const maxSlice = 75;
+  const targetEnd = Number.isFinite(rawEnd)
+    ? Math.max(winStart + 2, Math.min(totalDur, Math.ceil(rawEnd)))
+    : Math.min(totalDur, winStart + (totalDur > 90 ? 60 : totalDur));
+  const winDur = Math.max(2, Math.min(maxSlice, targetEnd - winStart));
+
+  fs.mkdirSync(PREVIEWS_DIR, { recursive: true });
+  const cacheTag = hasWindow || totalDur > 90 ? `w${winStart}-${Math.round(winDur)}` : 'full';
+  const outPath = path.join(PREVIEWS_DIR, `video-${video.id}-${cacheTag}-preview.${format}`);
+
+  try {
+    if (!fs.existsSync(outPath) || fs.statSync(outPath).size === 0) {
+      let pending = activePreviewJobs.get(outPath);
+      if (!pending) {
+        const tmpPath = `${outPath}.tmp.${Date.now()}.${format}`;
+        const seekArgs = hasWindow || totalDur > 90
+          ? ['-ss', winStart.toFixed(2), '-t', winDur.toFixed(2)]
+          : [];
+        const args =
+          format === 'webm'
+            ? [
+                '-y',
+                ...seekArgs,
+                '-i',
+                videoPath,
+                '-vf',
+                'scale=-2:480',
+                '-r',
+                '30',
+                '-c:v',
+                'libvpx',
+                '-deadline',
+                'realtime',
+                '-cpu-used',
+                '8',
+                '-b:v',
+                '900k',
+                ...(video.hasAudio ? ['-c:a', 'libopus', '-b:a', '96k'] : ['-an']),
+                tmpPath,
+              ]
+            : [
+                '-y',
+                ...seekArgs,
+                '-i',
+                videoPath,
+                '-vf',
+                'scale=-2:480',
+                '-r',
+                '30',
+                '-c:v',
+                'libx264',
+                '-preset',
+                'ultrafast',
+                '-crf',
+                '26',
+                '-pix_fmt',
+                'yuv420p',
+                '-movflags',
+                '+faststart',
+                ...(video.hasAudio ? ['-c:a', 'aac', '-b:a', '96k'] : ['-an']),
+                tmpPath,
+              ];
+
+        pending = execFileAsync('ffmpeg', args, { timeout: 90000 })
+          .then(() => {
+            fs.renameSync(tmpPath, outPath);
+          })
+          .catch((err) => {
+            safeUnlink(tmpPath);
+            throw err;
+          })
+          .finally(() => {
+            activePreviewJobs.delete(outPath);
+          });
+        activePreviewJobs.set(outPath, pending);
+      }
+      await pending;
+    }
+
+    res.sendFile(outPath);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Preview generation failed';
+    res.status(500).json({ error: message });
+  }
+});
+
 app.delete('/api/videos/:id', async (req, res) => {
   const videoId = Number(req.params.id);
   const db = readDb();
@@ -980,6 +1125,17 @@ app.delete('/api/videos/:id', async (req, res) => {
 
   if (!video.sourceUrl) {
     safeUnlink(path.join(UPLOADS_DIR, path.basename(video.filename)));
+  }
+  if (fs.existsSync(PREVIEWS_DIR)) {
+    for (const f of fs.readdirSync(PREVIEWS_DIR)) {
+      if (f.startsWith(`video-${video.id}-`)) {
+        safeUnlink(path.join(PREVIEWS_DIR, f));
+      }
+    }
+  }
+  for (const clip of db.clips.filter((c) => c.videoId === videoId)) {
+    if (clip.exportedUrl) safeUnlink(path.join(CLIPS_DIR, path.basename(clip.exportedUrl)));
+    if (clip.srtUrl) safeUnlink(path.join(CLIPS_DIR, path.basename(clip.srtUrl)));
   }
 
   await mutateDb((state) => {
@@ -1317,6 +1473,9 @@ app.get('/api/clips/:id/download', (req, res) => {
 
 app.delete('/api/clips/:id', async (req, res) => {
   const clipId = Number(req.params.id);
+  const clip = readDb().clips.find((c) => c.id === clipId);
+  if (clip?.exportedUrl) safeUnlink(path.join(CLIPS_DIR, path.basename(clip.exportedUrl)));
+  if (clip?.srtUrl) safeUnlink(path.join(CLIPS_DIR, path.basename(clip.srtUrl)));
   await mutateDb((db) => {
     db.clips = db.clips.filter((c) => c.id !== clipId);
   });
@@ -1350,10 +1509,12 @@ app.post('/api/scoring-lab/test', (req, res) => {
 
 app.post('/api/storage/cleanup', (_req, res) => {
   let removed = 0;
-  if (fs.existsSync(TRANSCRIPTS_DIR)) {
-    for (const file of fs.readdirSync(TRANSCRIPTS_DIR)) {
-      safeUnlink(path.join(TRANSCRIPTS_DIR, file));
-      removed++;
+  for (const dir of [TRANSCRIPTS_DIR, PREVIEWS_DIR]) {
+    if (fs.existsSync(dir)) {
+      for (const file of fs.readdirSync(dir)) {
+        safeUnlink(path.join(dir, file));
+        removed++;
+      }
     }
   }
   res.json({ ok: true, removed, storageBytes: getStorageUsageBytes() });
@@ -1386,8 +1547,50 @@ async function startServer() {
       res.sendFile(path.join(distDir, 'index.html'));
     });
   } else {
+    // Serve a WebSocket-free Vite client shim because HMR is disabled in the iframe proxy
+    app.get('/@vite/client', (_req, res) => {
+      res.type('application/javascript').send(`
+const sheetsMap = new Map();
+export class ErrorOverlay extends HTMLElement {}
+export function createHotContext() {
+  return {
+    data: {},
+    accept() {},
+    acceptExports() {},
+    dispose() {},
+    prune() {},
+    decline() {},
+    invalidate() {},
+    on() {},
+    off() {},
+    send() {},
+  };
+}
+export function injectQuery(url) { return url; }
+export function updateStyle(id, content) {
+  let style = sheetsMap.get(id);
+  if (!style) {
+    style = document.createElement('style');
+    style.setAttribute('type', 'text/css');
+    style.setAttribute('data-vite-dev-id', id);
+    style.textContent = content;
+    document.head.appendChild(style);
+    sheetsMap.set(id, style);
+  } else {
+    style.textContent = content;
+  }
+}
+export function removeStyle(id) {
+  const style = sheetsMap.get(id);
+  if (style) {
+    document.head.removeChild(style);
+    sheetsMap.delete(id);
+  }
+}
+`);
+    });
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { middlewareMode: true, hmr: false, ws: false },
       appType: 'spa',
     });
     app.use(vite.middlewares);

@@ -159,11 +159,22 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
   );
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const pendingSeekRef = useRef<number | null>(null);
   const [inspectorTab, setInspectorTab] = useState<'score' | 'subtitles' | 'transcript'>('score');
-  const [previewSource, setPreviewSource] = useState<'live' | 'compiled'>('live');
+  const [previewSource, setPreviewSource] = useState<'live' | 'compiled'>(
+    activeClip?.exportedUrl ? 'compiled' : 'live'
+  );
+  const [hasLiveEdits, setHasLiveEdits] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
+  const [liveWindow, setLiveWindow] = useState<{ start: number; end: number }>({
+    start: Math.max(0, Math.floor((activeClip?.startTime ?? 0) - 4)),
+    end: Math.min(
+      Math.max(1, activeVideo?.duration ?? 60),
+      Math.ceil((activeClip?.endTime ?? 30) + 4)
+    ),
+  });
 
   const [draft, setDraft] = useState<ClipRecord | null>(activeClip);
   const [segmentsDraft, setSegmentsDraft] = useState<TranscriptSegment[]>(
@@ -172,46 +183,178 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
   const [isSaving, setIsSaving] = useState(false);
   const [isCompiling, setIsCompiling] = useState(false);
   const [isRescoring, setIsRescoring] = useState(false);
+  const [mediaError, setMediaError] = useState<string | null>(null);
+  const [fallbackMode, setFallbackMode] = useState<'none' | 'mp4' | 'webm'>('none');
+  const [isFallbackLoading, setIsFallbackLoading] = useState(false);
   const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+
+  const computeWindowForRange = (startSec: number, endSec: number, totalDur: number) => {
+    const safeDur = Math.max(1, totalDur);
+    const start = Math.max(0, Math.floor(startSec - 4));
+    const desiredEnd = Math.ceil(Math.max(start + 12, endSec + 4));
+    const end = Math.min(safeDur, Math.min(desiredEnd, start + 70));
+    return { start, end };
+  };
+
+  const isLargeOrLongVideo = Boolean(
+    activeVideo && (activeVideo.sizeBytes > 60 * 1024 * 1024 || activeVideo.duration > 90)
+  );
+  const isUsingWindowedLive =
+    previewSource === 'live' && Boolean(activeVideo) && (isLargeOrLongVideo || fallbackMode !== 'none');
+  const windowOffset = isUsingWindowedLive ? liveWindow.start : 0;
+
+  const resolvedVideoSrc = useMemo(() => {
+    if (previewSource === 'compiled' && draft?.exportedUrl) {
+      return draft.exportedUrl;
+    }
+    if (!activeVideo?.fileUrl) return '';
+    if (isUsingWindowedLive) {
+      const fmt = fallbackMode === 'webm' ? 'webm' : 'mp4';
+      return `/api/videos/${activeVideo.id}/preview?start=${liveWindow.start}&end=${liveWindow.end}&format=${fmt}`;
+    }
+    return activeVideo.fileUrl;
+  }, [previewSource, draft?.exportedUrl, activeVideo, isUsingWindowedLive, fallbackMode, liveWindow.start, liveWindow.end]);
+
+  useEffect(() => {
+    setFallbackMode('none');
+    setMediaError(null);
+    setIsFallbackLoading(false);
+  }, [activeVideo?.id, previewSource, draft?.exportedUrl]);
 
   useEffect(() => {
     setDraft(activeClip);
-    setPreviewSource('live');
+    const startMode = activeClip?.exportedUrl ? 'compiled' : 'live';
+    setPreviewSource(startMode);
+    setHasLiveEdits(false);
     setFeedback(null);
-    if (activeClip && videoRef.current) {
-      videoRef.current.currentTime = activeClip.startTime;
+    setMediaError(null);
+    setIsPlaying(false);
+    pendingSeekRef.current = null;
+    if (activeClip && activeVideo) {
+      setLiveWindow(
+        computeWindowForRange(activeClip.startTime, activeClip.endTime, activeVideo.duration)
+      );
+    }
+    if (startMode === 'compiled') {
+      setCurrentTime(0);
+    } else if (activeClip) {
       setCurrentTime(activeClip.startTime);
-      setIsPlaying(false);
     }
   }, [activeClip?.id]);
+
+  // Keep draft synced if parent workspace refreshes with newly rendered exportedUrl
+  useEffect(() => {
+    if (activeClip && draft && activeClip.id === draft.id && !draft.exportedUrl && activeClip.exportedUrl) {
+      setDraft(activeClip);
+      if (!hasLiveEdits) {
+        setPreviewSource('compiled');
+        setCurrentTime(0);
+      }
+    }
+  }, [activeClip?.exportedUrl]);
 
   useEffect(() => {
     setSegmentsDraft(activeTranscription?.segments ?? []);
   }, [activeTranscription?.id, activeTranscription?.segments]);
 
+  const updateDraftLive = (next: ClipRecord) => {
+    setDraft(next);
+    if (previewSource === 'compiled') {
+      setPreviewSource('live');
+      setHasLiveEdits(true);
+      setCurrentTime(next.startTime);
+    } else {
+      setHasLiveEdits(true);
+    }
+    if (activeVideo && (next.startTime < liveWindow.start || next.endTime > liveWindow.end)) {
+      setLiveWindow(computeWindowForRange(next.startTime, next.endTime, activeVideo.duration));
+    }
+  };
+
+  const handleVideoError = () => {
+    setIsPlaying(false);
+    setIsFallbackLoading(false);
+    if (previewSource === 'live' && activeVideo) {
+      if (!isUsingWindowedLive) {
+        setFallbackMode('mp4');
+        setIsFallbackLoading(true);
+        return;
+      }
+      if (fallbackMode !== 'webm') {
+        setFallbackMode('webm');
+        setIsFallbackLoading(true);
+        return;
+      }
+    }
+    setMediaError(t.mediaPlaybackError);
+  };
+
+  const handleVideoLoadedMetadata = () => {
+    setIsFallbackLoading(false);
+    setMediaError(null);
+    const el = videoRef.current;
+    if (!el) return;
+    if (previewSource === 'compiled') {
+      el.currentTime = 0;
+      setCurrentTime(0);
+      return;
+    }
+    if (draft) {
+      const requestedAbs = pendingSeekRef.current ?? draft.startTime;
+      pendingSeekRef.current = null;
+      const localTarget = Math.max(0, requestedAbs - windowOffset);
+      const bounded = Math.min(el.duration || Math.max(1, localTarget), localTarget);
+      if (Math.abs(el.currentTime - bounded) > 0.35) {
+        el.currentTime = bounded;
+      }
+      setCurrentTime(windowOffset + bounded);
+    }
+  };
+
   const handleTimeUpdate = () => {
     const el = videoRef.current;
     if (!el) return;
-    const sec = el.currentTime;
-    setCurrentTime(sec);
-    if (previewSource === 'live' && draft && isPlaying && sec >= draft.endTime) {
-      el.currentTime = draft.startTime;
+    if (previewSource === 'compiled') {
+      setCurrentTime(el.currentTime);
+      return;
+    }
+    const absSec = windowOffset + el.currentTime;
+    setCurrentTime(absSec);
+    if (draft && isPlaying && absSec >= draft.endTime) {
+      el.currentTime = Math.max(0, draft.startTime - windowOffset);
     }
   };
 
   const togglePlay = () => {
     const el = videoRef.current;
-    if (!el) return;
+    if (!el || !resolvedVideoSrc || mediaError) return;
     if (el.paused) {
-      if (
-        previewSource === 'live' &&
-        draft &&
-        (el.currentTime < draft.startTime || el.currentTime >= draft.endTime)
-      ) {
-        el.currentTime = draft.startTime;
+      if (previewSource === 'live' && el.readyState >= 1 && draft) {
+        const absSec = windowOffset + el.currentTime;
+        if (absSec < draft.startTime || absSec >= draft.endTime) {
+          el.currentTime = Math.max(0, draft.startTime - windowOffset);
+        }
       }
-      void el.play();
-      setIsPlaying(true);
+      try {
+        const playPromise = el.play();
+        if (playPromise !== undefined) {
+          playPromise
+            .then(() => {
+              setIsPlaying(true);
+              setMediaError(null);
+            })
+            .catch((err: unknown) => {
+              setIsPlaying(false);
+              if (err instanceof DOMException && err.name === 'AbortError') return;
+              handleVideoError();
+            });
+        } else {
+          setIsPlaying(true);
+        }
+      } catch {
+        setIsPlaying(false);
+        handleVideoError();
+      }
     } else {
       el.pause();
       setIsPlaying(false);
@@ -221,9 +364,31 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
   const seekTo = (sec: number) => {
     const el = videoRef.current;
     if (!el || !activeVideo) return;
+    if (previewSource === 'compiled') {
+      const clipDur = draft ? Math.max(1, draft.endTime - draft.startTime) : 1;
+      const clamped = Math.max(0, Math.min(clipDur, sec));
+      setCurrentTime(clamped);
+      if (el.readyState >= 1) {
+        el.currentTime = clamped;
+      }
+      return;
+    }
     const clamped = Math.max(0, Math.min(activeVideo.duration, sec));
-    el.currentTime = clamped;
     setCurrentTime(clamped);
+    if (isUsingWindowedLive && (clamped < liveWindow.start || clamped > liveWindow.end)) {
+      pendingSeekRef.current = clamped;
+      setLiveWindow(
+        computeWindowForRange(
+          clamped,
+          Math.min(activeVideo.duration, clamped + 25),
+          activeVideo.duration
+        )
+      );
+      return;
+    }
+    if (el.readyState >= 1) {
+      el.currentTime = Math.max(0, clamped - windowOffset);
+    }
   };
 
   const activeSegment = useMemo(() => {
@@ -275,7 +440,9 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
       });
       const compiled = await onCompileClip(draft.id);
       setDraft(compiled);
+      setHasLiveEdits(false);
       setPreviewSource('compiled');
+      setCurrentTime(0);
       setFeedback({
         type: 'ok',
         text: `${t.compiledReady} (${compiled.aspectRatio} · ${formatBytes(compiled.exportedSizeBytes ?? 0)})`,
@@ -458,7 +625,14 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                         {formatTimecode(clip.startTime)}–{formatTimecode(clip.endTime)} ·{' '}
                         {Math.round(clip.endTime - clip.startTime)}s
                       </span>
-                      <span>{t.statusLabels[clip.status]}</span>
+                      <span className="flex items-center gap-1.5">
+                        {clip.exportedUrl && (
+                          <span className="font-mono text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
+                            MP4
+                          </span>
+                        )}
+                        <span>{t.statusLabels[clip.status]}</span>
+                      </span>
                     </div>
 
                     <div
@@ -519,7 +693,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                       <button
                         key={ratio}
                         type="button"
-                        onClick={() => setDraft({ ...draft, aspectRatio: ratio })}
+                        onClick={() => updateDraftLive({ ...draft, aspectRatio: ratio })}
                         className={`rounded-md px-2.5 py-1 font-mono text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
                           draft.aspectRatio === ratio
                             ? 'bg-white text-slate-900 shadow-sm dark:bg-[#252A36] dark:text-white'
@@ -536,7 +710,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                       <button
                         key={fm}
                         type="button"
-                        onClick={() => setDraft({ ...draft, framingMode: fm })}
+                        onClick={() => updateDraftLive({ ...draft, framingMode: fm })}
                         className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
                           draft.framingMode === fm
                             ? 'bg-white text-slate-900 shadow-sm dark:bg-[#252A36] dark:text-white'
@@ -578,7 +752,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                 </div>
               </div>
 
-              {(feedback || draft.exportedUrl) && (
+              {(feedback || draft.exportedUrl || hasLiveEdits) && (
                 <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-slate-50 px-4 py-2 text-xs dark:border-white/10 dark:bg-white/[0.02]">
                   <div className="flex items-center gap-2">
                     {feedback && (
@@ -592,7 +766,12 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                         {feedback.text}
                       </span>
                     )}
-                    {!feedback && draft.exportedUrl && (
+                    {!feedback && hasLiveEdits && (
+                      <span className="text-amber-600 dark:text-amber-400">
+                        {t.pendingRecompile}
+                      </span>
+                    )}
+                    {!feedback && !hasLiveEdits && draft.exportedUrl && (
                       <span className="text-emerald-600 dark:text-emerald-400">
                         {t.compiledReady} ({formatBytes(draft.exportedSizeBytes ?? 0)})
                       </span>
@@ -604,7 +783,10 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                       <div className="flex items-center gap-1 rounded-md bg-slate-200/70 p-0.5 dark:bg-[#181B22]">
                         <button
                           type="button"
-                          onClick={() => setPreviewSource('live')}
+                          onClick={() => {
+                            setPreviewSource('live');
+                            if (draft) setCurrentTime(draft.startTime);
+                          }}
                           className={`rounded px-2 py-0.5 text-[11px] font-medium ${
                             previewSource === 'live'
                               ? 'bg-white text-slate-900 dark:bg-[#252A36] dark:text-white'
@@ -615,7 +797,10 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                         </button>
                         <button
                           type="button"
-                          onClick={() => setPreviewSource('compiled')}
+                          onClick={() => {
+                            setPreviewSource('compiled');
+                            setCurrentTime(0);
+                          }}
                           className={`rounded px-2 py-0.5 text-[11px] font-medium ${
                             previewSource === 'compiled'
                               ? 'bg-white text-slate-900 dark:bg-[#252A36] dark:text-white'
@@ -658,35 +843,68 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                       : 'aspect-video w-full max-w-[680px]'
                   }`}
                 >
-                  <video
-                    ref={videoRef}
-                    key={`${previewSource}-${draft.exportedUrl ?? activeVideo.fileUrl}`}
-                    src={
-                      previewSource === 'compiled' && draft.exportedUrl
-                        ? draft.exportedUrl
-                        : activeVideo.fileUrl
-                    }
-                    muted={isMuted}
-                    playsInline
-                    onTimeUpdate={handleTimeUpdate}
-                    onEnded={() => setIsPlaying(false)}
-                    onClick={togglePlay}
-                    className="h-full w-full cursor-pointer"
-                    style={
-                      previewSource === 'compiled'
-                        ? { objectFit: 'contain' }
-                        : draft.framingMode === 'blur'
-                        ? {
-                            objectFit: 'contain',
-                            transform: `scale(${draft.zoom})`,
-                          }
-                        : {
-                            objectFit: 'cover',
-                            objectPosition: `${draft.cropX}% ${draft.cropY}%`,
-                            transform: `scale(${draft.zoom})`,
-                          }
-                    }
-                  />
+                  {resolvedVideoSrc && !mediaError ? (
+                    <video
+                      ref={videoRef}
+                      key={resolvedVideoSrc}
+                      src={resolvedVideoSrc}
+                      preload={previewSource === 'compiled' || isUsingWindowedLive ? 'auto' : 'metadata'}
+                      muted={isMuted}
+                      playsInline
+                      onLoadStart={() => {
+                        if (isUsingWindowedLive) setIsFallbackLoading(true);
+                      }}
+                      onLoadedMetadata={handleVideoLoadedMetadata}
+                      onCanPlay={() => setIsFallbackLoading(false)}
+                      onPlay={() => setIsPlaying(true)}
+                      onPause={() => setIsPlaying(false)}
+                      onError={handleVideoError}
+                      onTimeUpdate={handleTimeUpdate}
+                      onEnded={() => setIsPlaying(false)}
+                      onClick={togglePlay}
+                      className="h-full w-full cursor-pointer"
+                      style={
+                        previewSource === 'compiled'
+                          ? { objectFit: 'contain' }
+                          : draft.framingMode === 'blur'
+                          ? {
+                              objectFit: 'contain',
+                              transform: `scale(${draft.zoom})`,
+                            }
+                          : {
+                              objectFit: 'cover',
+                              objectPosition: `${draft.cropX}% ${draft.cropY}%`,
+                              transform: `scale(${draft.zoom})`,
+                            }
+                      }
+                    />
+                  ) : (
+                    <div className="relative flex h-full w-full flex-col items-center justify-center bg-slate-900 p-4 text-center">
+                      {activeVideo.thumbnailUrl && (
+                        <img
+                          src={activeVideo.thumbnailUrl}
+                          alt={activeVideo.title}
+                          referrerPolicy="no-referrer"
+                          className="absolute inset-0 h-full w-full object-cover opacity-35"
+                        />
+                      )}
+                      <div className="relative z-10 max-w-xs space-y-2 rounded-lg border border-white/15 bg-black/75 p-3">
+                        <Film className="mx-auto h-6 w-6 text-emerald-400" />
+                        <p className="text-xs leading-relaxed text-slate-200">
+                          {mediaError || t.mediaPlaybackError}
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  {isFallbackLoading && !mediaError && (
+                    <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/60 p-4">
+                      <div className="flex items-center gap-2 rounded-md bg-black/80 px-3 py-2 text-xs text-slate-200">
+                        <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-400" />
+                        <span>{t.loadingFallbackPreview}</span>
+                      </div>
+                    </div>
+                  )}
 
                   {previewSource === 'live' &&
                     draft.subtitleStyle.enabled &&
@@ -748,7 +966,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
-                      onClick={() => seekTo(draft.startTime)}
+                      onClick={() => seekTo(previewSource === 'compiled' ? 0 : draft.startTime)}
                       className="rounded-md p-1.5 text-slate-500 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-white/5 dark:hover:text-white"
                       title={t.start}
                     >
@@ -769,7 +987,9 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                       {isMuted ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
                     </button>
                     <span className="font-mono text-xs text-slate-700 dark:text-slate-200 tabular-nums">
-                      {formatTimecode(currentTime, true)} / {formatTimecode(activeVideo.duration, true)}
+                      {previewSource === 'compiled'
+                        ? `${formatTimecode(currentTime, true)} / ${formatTimecode(clipDuration, true)}`
+                        : `${formatTimecode(currentTime, true)} / ${formatTimecode(activeVideo.duration, true)}`}
                     </span>
                   </div>
 
@@ -784,34 +1004,47 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                   onClick={(e) => {
                     const rect = e.currentTarget.getBoundingClientRect();
                     const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-                    seekTo(pct * activeVideo.duration);
+                    seekTo(pct * (previewSource === 'compiled' ? clipDuration : activeVideo.duration));
                   }}
                 >
-                  <div
-                    className="absolute inset-y-1 rounded border border-emerald-500 bg-emerald-500/20"
-                    style={{
-                      left: `${(draft.startTime / Math.max(1, activeVideo.duration)) * 100}%`,
-                      width: `${((draft.endTime - draft.startTime) / Math.max(1, activeVideo.duration)) * 100}%`,
-                    }}
-                  />
-                  <div
-                    className="absolute inset-y-0 w-0.5 bg-slate-900 dark:bg-white"
-                    style={{
-                      left: `${(currentTime / Math.max(1, activeVideo.duration)) * 100}%`,
-                    }}
-                  />
+                  {previewSource === 'compiled' ? (
+                    <>
+                      <div
+                        className="absolute inset-y-1 left-0 rounded bg-emerald-500/25 border-r-2 border-emerald-500"
+                        style={{
+                          width: `${Math.min(100, (currentTime / Math.max(1, clipDuration)) * 100)}%`,
+                        }}
+                      />
+                    </>
+                  ) : (
+                    <>
+                      <div
+                        className="absolute inset-y-1 rounded border border-emerald-500 bg-emerald-500/20"
+                        style={{
+                          left: `${(draft.startTime / Math.max(1, activeVideo.duration)) * 100}%`,
+                          width: `${((draft.endTime - draft.startTime) / Math.max(1, activeVideo.duration)) * 100}%`,
+                        }}
+                      />
+                      <div
+                        className="absolute inset-y-0 w-0.5 bg-slate-900 dark:bg-white"
+                        style={{
+                          left: `${(currentTime / Math.max(1, activeVideo.duration)) * 100}%`,
+                        }}
+                      />
+                    </>
+                  )}
                 </div>
 
-                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                  <div className="flex items-center justify-between gap-2 rounded-lg border border-slate-200 px-3 py-1.5 dark:border-white/10">
-                    <span className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                <div className="grid grid-cols-1 gap-2.5 xl:grid-cols-2">
+                  <div className="flex min-w-0 items-center justify-between gap-2 rounded-lg border border-slate-200 px-3 py-1.5 dark:border-white/10">
+                    <span className="text-xs font-medium text-slate-500 dark:text-slate-400 shrink-0">
                       {t.start}
                     </span>
-                    <div className="flex items-center gap-1.5">
+                    <div className="flex items-center gap-1.5 shrink-0">
                       <button
                         type="button"
                         onClick={() =>
-                          setDraft({
+                          updateDraftLive({
                             ...draft,
                             startTime: Math.max(0, Math.round((draft.startTime - 0.5) * 10) / 10),
                           })
@@ -826,7 +1059,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                       <button
                         type="button"
                         onClick={() =>
-                          setDraft({
+                          updateDraftLive({
                             ...draft,
                             startTime: Math.min(
                               draft.endTime - 2,
@@ -841,15 +1074,15 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                     </div>
                   </div>
 
-                  <div className="flex items-center justify-between gap-2 rounded-lg border border-slate-200 px-3 py-1.5 dark:border-white/10">
-                    <span className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                  <div className="flex min-w-0 items-center justify-between gap-2 rounded-lg border border-slate-200 px-3 py-1.5 dark:border-white/10">
+                    <span className="text-xs font-medium text-slate-500 dark:text-slate-400 shrink-0">
                       {t.end}
                     </span>
-                    <div className="flex items-center gap-1.5">
+                    <div className="flex items-center gap-1.5 shrink-0">
                       <button
                         type="button"
                         onClick={() =>
-                          setDraft({
+                          updateDraftLive({
                             ...draft,
                             endTime: Math.max(
                               draft.startTime + 2,
@@ -867,7 +1100,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                       <button
                         type="button"
                         onClick={() =>
-                          setDraft({
+                          updateDraftLive({
                             ...draft,
                             endTime: Math.min(
                               activeVideo.duration,
@@ -1059,7 +1292,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                   <button
                     type="button"
                     onClick={() =>
-                      setDraft({
+                      updateDraftLive({
                         ...draft,
                         subtitleStyle: {
                           ...draft.subtitleStyle,
@@ -1083,7 +1316,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                       key={p.id}
                       type="button"
                       onClick={() =>
-                        setDraft({
+                        updateDraftLive({
                           ...draft,
                           subtitleStyle: { ...draft.subtitleStyle, ...p.style },
                         })
@@ -1113,7 +1346,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                       max={34}
                       value={draft.subtitleStyle.fontSize}
                       onChange={(e) =>
-                        setDraft({
+                        updateDraftLive({
                           ...draft,
                           subtitleStyle: {
                             ...draft.subtitleStyle,
@@ -1135,7 +1368,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                           type="color"
                           value={draft.subtitleStyle.textColor}
                           onChange={(e) =>
-                            setDraft({
+                            updateDraftLive({
                               ...draft,
                               subtitleStyle: {
                                 ...draft.subtitleStyle,
@@ -1160,7 +1393,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                           type="color"
                           value={draft.subtitleStyle.highlightColor}
                           onChange={(e) =>
-                            setDraft({
+                            updateDraftLive({
                               ...draft,
                               subtitleStyle: {
                                 ...draft.subtitleStyle,
@@ -1185,7 +1418,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                       <select
                         value={draft.subtitleStyle.position}
                         onChange={(e) =>
-                          setDraft({
+                          updateDraftLive({
                             ...draft,
                             subtitleStyle: {
                               ...draft.subtitleStyle,
@@ -1208,7 +1441,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                       <select
                         value={draft.subtitleStyle.alignment}
                         onChange={(e) =>
-                          setDraft({
+                          updateDraftLive({
                             ...draft,
                             subtitleStyle: {
                               ...draft.subtitleStyle,
@@ -1231,7 +1464,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                       type="checkbox"
                       checked={draft.subtitleStyle.backgroundBox}
                       onChange={(e) =>
-                        setDraft({
+                        updateDraftLive({
                           ...draft,
                           subtitleStyle: {
                             ...draft.subtitleStyle,
@@ -1260,7 +1493,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                       min={0}
                       max={100}
                       value={draft.cropX}
-                      onChange={(e) => setDraft({ ...draft, cropX: Number(e.target.value) })}
+                      onChange={(e) => updateDraftLive({ ...draft, cropX: Number(e.target.value) })}
                       className="w-full accent-emerald-500"
                     />
                   </div>
@@ -1276,7 +1509,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                       min={0}
                       max={100}
                       value={draft.cropY}
-                      onChange={(e) => setDraft({ ...draft, cropY: Number(e.target.value) })}
+                      onChange={(e) => updateDraftLive({ ...draft, cropY: Number(e.target.value) })}
                       className="w-full accent-emerald-500"
                     />
                   </div>
@@ -1293,7 +1526,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                       max={2}
                       step={0.05}
                       value={draft.zoom}
-                      onChange={(e) => setDraft({ ...draft, zoom: Number(e.target.value) })}
+                      onChange={(e) => updateDraftLive({ ...draft, zoom: Number(e.target.value) })}
                       className="w-full accent-emerald-500"
                     />
                   </div>
@@ -1362,7 +1595,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                                 <button
                                   type="button"
                                   onClick={() =>
-                                    setDraft({
+                                    updateDraftLive({
                                       ...draft,
                                       startTime: Math.min(seg.start, draft.endTime - 2),
                                     })
@@ -1374,7 +1607,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                                 <button
                                   type="button"
                                   onClick={() =>
-                                    setDraft({
+                                    updateDraftLive({
                                       ...draft,
                                       endTime: Math.max(seg.end, draft.startTime + 2),
                                     })

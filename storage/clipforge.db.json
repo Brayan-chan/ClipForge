@@ -102,7 +102,7 @@
       },
       "reason": "Mistake / Lesson opening · High informational density · Self-contained context",
       "scoringSource": "heuristic",
-      "status": "approved",
+      "status": "exported",
       "aspectRatio": "9:16",
       "framingMode": "crop",
       "cropX": 50,
@@ -118,10 +118,11 @@
         "alignment": "center",
         "backgroundBox": true
       },
-      "exportedUrl": null,
-      "srtUrl": null,
-      "thumbnailUrl": "/storage/thumbnails/clip-4-preview.jpg",
-      "createdAt": "2026-11-18T19:36:32.521Z"
+      "exportedUrl": "/storage/clips/clip-4-1795036033057.mp4",
+      "srtUrl": "/storage/clips/clip-4-1795036033057.srt",
+      "thumbnailUrl": "/storage/thumbnails/clip-4-1795036033057.jpg",
+      "createdAt": "2026-11-18T19:36:32.521Z",
+      "exportedSizeBytes": 126200
     },
     {
       "id": 5,
@@ -143,7 +144,7 @@
       },
       "reason": "Curiosity Gap opening · High informational density · Self-contained context",
       "scoringSource": "heuristic",
-      "status": "candidate",
+      "status": "exported",
       "aspectRatio": "9:16",
       "framingMode": "crop",
       "cropX": 50,
@@ -159,10 +160,11 @@
         "alignment": "center",
         "backgroundBox": true
       },
-      "exportedUrl": null,
-      "srtUrl": null,
-      "thumbnailUrl": "/storage/thumbnails/clip-5-preview.jpg",
-      "createdAt": "2026-11-18T19:36:32.521Z"
+      "exportedUrl": "/storage/clips/clip-5-1795036037791.mp4",
+      "srtUrl": "/storage/clips/clip-5-1795036037791.srt",
+      "thumbnailUrl": "/storage/thumbnails/clip-5-1795036037791.jpg",
+      "createdAt": "2026-11-18T19:36:32.521Z",
+      "exportedSizeBytes": 118093
     }
   ],
   "processingJobs": [
@@ -210,9 +212,9 @@
   "nextIds": {
     "user": 2,
     "project": 2,
-    "video": 6,
-    "transcription": 8,
-    "clip": 10,
-    "job": 8
+    "video": 8,
+    "transcription": 10,
+    "clip": 13,
+    "job": 10
   }
 }

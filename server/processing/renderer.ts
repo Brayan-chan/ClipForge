@@ -197,12 +197,14 @@ export async function renderClipWithFfmpeg(params: {
     videoPath,
     '-vf',
     videoFilter,
+    '-r',
+    '30',
     '-c:v',
     'libx264',
     '-preset',
     'veryfast',
     '-crf',
-    '23',
+    '24',
     '-pix_fmt',
     'yuv420p',
     '-movflags',
@@ -217,7 +219,7 @@ export async function renderClipWithFfmpeg(params: {
 
   args.push(mp4Path);
 
-  await execFileAsync('ffmpeg', args);
+  await execFileAsync('ffmpeg', args, { timeout: 120000 });
 
   // Clean up temporary .ass file after burn-in
   if (fs.existsSync(assPath)) {

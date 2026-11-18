@@ -38,7 +38,7 @@ export const TopBar: React.FC<TopBarProps> = ({
         </button>
 
         {/* Zone 2: 4 concise single-line text navigation links */}
-        <nav className="flex items-center gap-6 overflow-x-auto">
+        <nav className="flex h-16 items-center gap-4 sm:gap-6">
           {navItems.map((item) => {
             const isActive = activeTab === item.id;
             return (
@@ -46,15 +46,15 @@ export const TopBar: React.FC<TopBarProps> = ({
                 key={item.id}
                 type="button"
                 onClick={() => onSelectTab(item.id)}
-                className={`relative py-2 text-sm font-medium transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 rounded-sm ${
+                className={`relative flex h-full items-center text-sm font-medium transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 rounded-sm ${
                   isActive
                     ? 'text-slate-900 dark:text-white'
                     : 'text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white'
                 }`}
               >
-                {item.label}
+                <span>{item.label}</span>
                 {isActive && (
-                  <span className="absolute inset-x-0 -bottom-[17px] h-0.5 bg-emerald-500" />
+                  <span className="absolute inset-x-0 bottom-0 h-0.5 bg-emerald-500" />
                 )}
               </button>
             );
