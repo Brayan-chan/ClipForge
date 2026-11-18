@@ -1,0 +1,203 @@
+{
+  "users": [
+    {
+      "id": 1,
+      "email": "creator@clipforge.local",
+      "name": "Studio Creator"
+    }
+  ],
+  "projects": [
+    {
+      "id": 1,
+      "userId": 1,
+      "name": "Podcast & Tech Clips MVP",
+      "description": "Long-form interviews and builder episodes converted into 9:16 vertical shorts.",
+      "createdAt": "2026-11-18T19:17:25.683Z"
+    }
+  ],
+  "videos": [
+    {
+      "id": 1,
+      "projectId": 1,
+      "title": "ClipForge Architecture Podcast (Ep. 04)",
+      "filename": "demo-podcast-1795029445710.mp4",
+      "originalName": "demo-podcast-ep04.mp4",
+      "fileUrl": "/storage/uploads/demo-podcast-1795029445710.mp4",
+      "thumbnailUrl": "/storage/thumbnails/video-1-cover.jpg",
+      "duration": 36,
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "hasAudio": true,
+      "sizeBytes": 174106,
+      "status": "ready",
+      "createdAt": "2026-11-18T19:17:42.276Z"
+    }
+  ],
+  "transcriptions": [
+    {
+      "id": 2,
+      "videoId": 1,
+      "source": "sample",
+      "language": "auto",
+      "segments": [
+        {
+          "id": "seg-1",
+          "start": 0,
+          "end": 5.5,
+          "text": "Mucha gente piensa que lanzar un SaaS de clipping de video requiere cinco agentes de IA conversando."
+        },
+        {
+          "id": "seg-2",
+          "start": 5.5,
+          "end": 11.5,
+          "text": "Pero realmente el 80 por ciento del problema se resuelve con procesamiento tradicional y FFmpeg."
+        },
+        {
+          "id": "seg-3",
+          "start": 11.5,
+          "end": 17.5,
+          "text": "Por qué fracasan los prototipos caros? Porque queman tokens antes de filtrar los mejores momentos."
+        },
+        {
+          "id": "seg-4",
+          "start": 17.5,
+          "end": 23.5,
+          "text": "La arquitectura ganadora usa una rúbrica determinista de 100 puntos antes de llamar al modelo."
+        },
+        {
+          "id": "seg-5",
+          "start": 23.5,
+          "end": 30,
+          "text": "Paso uno: extraer audio ligero y transcribir con marcas de tiempo exactas para cada frase."
+        },
+        {
+          "id": "seg-6",
+          "start": 30,
+          "end": 36,
+          "text": "Paso dos: FFmpeg recorta a formato vertical 9:16, quema subtítulos y exporta tu clip listo!"
+        }
+      ],
+      "createdAt": "2026-11-18T19:18:17.986Z"
+    }
+  ],
+  "clips": [
+    {
+      "id": 2,
+      "videoId": 1,
+      "title": "Mucha gente piensa que lanzar un SaaS...",
+      "hookText": "Mucha gente piensa que lanzar un SaaS de clipping de video requiere cinco agentes de IA conversando.",
+      "startTime": 0,
+      "endTime": 17.5,
+      "score": 79,
+      "breakdown": {
+        "hook": 19,
+        "infoValue": 19,
+        "emotion": 11,
+        "selfContained": 20,
+        "durationFit": 10
+      },
+      "reason": "Strong opening hook · High informational density · Self-contained thought",
+      "scoringSource": "heuristic",
+      "status": "exported",
+      "aspectRatio": "9:16",
+      "framingMode": "crop",
+      "cropX": 50,
+      "cropY": 50,
+      "zoom": 1,
+      "subtitleStyle": {
+        "enabled": true,
+        "preset": "hormozi",
+        "fontSize": 22,
+        "textColor": "#FFFFFF",
+        "highlightColor": "#22C55E",
+        "position": "bottom",
+        "alignment": "center",
+        "backgroundBox": true
+      },
+      "exportedUrl": "/storage/clips/clip-2-1795029499890.mp4",
+      "srtUrl": "/storage/clips/clip-2-1795029499890.srt",
+      "thumbnailUrl": "/storage/thumbnails/clip-2-1795029499890.jpg",
+      "createdAt": "2026-11-18T19:18:18.196Z",
+      "exportedSizeBytes": 122805
+    },
+    {
+      "id": 3,
+      "videoId": 1,
+      "title": "Por qué fracasan los prototipos caros Porque...",
+      "hookText": "Por qué fracasan los prototipos caros? Porque queman tokens antes de filtrar los mejores momentos.",
+      "startTime": 11.5,
+      "endTime": 30,
+      "score": 79,
+      "breakdown": {
+        "hook": 19,
+        "infoValue": 19,
+        "emotion": 11,
+        "selfContained": 20,
+        "durationFit": 10
+      },
+      "reason": "Strong opening hook · High informational density · Self-contained thought",
+      "scoringSource": "heuristic",
+      "status": "candidate",
+      "aspectRatio": "9:16",
+      "framingMode": "crop",
+      "cropX": 50,
+      "cropY": 50,
+      "zoom": 1,
+      "subtitleStyle": {
+        "enabled": true,
+        "preset": "hormozi",
+        "fontSize": 22,
+        "textColor": "#FFFFFF",
+        "highlightColor": "#22C55E",
+        "position": "bottom",
+        "alignment": "center",
+        "backgroundBox": true
+      },
+      "exportedUrl": null,
+      "srtUrl": null,
+      "thumbnailUrl": "/storage/thumbnails/clip-3-preview.jpg",
+      "createdAt": "2026-11-18T19:18:18.375Z"
+    }
+  ],
+  "processingJobs": [
+    {
+      "id": 1,
+      "projectId": 1,
+      "videoId": 1,
+      "stage": "completed",
+      "progress": 100,
+      "message": "Pipeline complete: 1 clips detected and scored.",
+      "useAi": false,
+      "updatedAt": "2026-11-18T19:17:42.745Z"
+    },
+    {
+      "id": 2,
+      "projectId": 1,
+      "videoId": 1,
+      "stage": "completed",
+      "progress": 100,
+      "message": "Pipeline complete: 2 clips detected and scored.",
+      "useAi": false,
+      "updatedAt": "2026-11-18T19:18:18.376Z"
+    }
+  ],
+  "scoringConfig": {
+    "hookWeight": 25,
+    "infoWeight": 25,
+    "emotionWeight": 20,
+    "selfContainedWeight": 20,
+    "durationWeight": 10,
+    "llmThreshold": 55,
+    "minClipSeconds": 12,
+    "maxClipSeconds": 60
+  },
+  "nextIds": {
+    "user": 2,
+    "project": 2,
+    "video": 2,
+    "transcription": 3,
+    "clip": 4,
+    "job": 3
+  }
+}

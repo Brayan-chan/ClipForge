@@ -1,0 +1,8 @@
+{
+  "name": "ClipForge",
+  "description": "AI-assisted deterministic video clipping studio with FFmpeg 9:16 vertical export, burned-in subtitles, and heuristic moment scoring.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
