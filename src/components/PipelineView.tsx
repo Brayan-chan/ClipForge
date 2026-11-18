@@ -92,6 +92,13 @@ export const PipelineView: React.FC<PipelineViewProps> = ({
             )}
           </div>
           <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">{t.ffmpegDesc}</p>
+          <div className="mt-3 flex items-center justify-between border-t border-slate-100 pt-2.5 text-[11px] text-slate-500 dark:border-white/5 dark:text-slate-400">
+            <span>{t.queueStatusLabel}</span>
+            <span className="font-mono font-medium text-slate-800 dark:text-slate-200 tabular-nums">
+              {t.queueActive}: {status?.activeQueueTasks ?? 0} · {t.queueWaiting}:{' '}
+              {status?.queuedTasks ?? 0}
+            </span>
+          </div>
         </div>
 
         <div className="rounded-xl border border-slate-200 bg-white p-5 dark:border-white/10 dark:bg-[#111318]">
@@ -128,6 +135,9 @@ export const PipelineView: React.FC<PipelineViewProps> = ({
           <div className="mt-2 font-mono text-2xl font-semibold text-slate-900 dark:text-white tabular-nums">
             {formatBytes(status?.storageBytes ?? 0)}
           </div>
+          <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+            {t.storagePrivateNote}
+          </p>
           <div className="mt-3">
             <button
               type="button"

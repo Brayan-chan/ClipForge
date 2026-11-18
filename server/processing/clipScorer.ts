@@ -1,5 +1,6 @@
 import type {
   ClipScoreBreakdown,
+  ContextStatus,
   ScoringConfig,
   TranscriptSegment,
 } from '../../src/types';
@@ -8,6 +9,9 @@ import { DEFAULT_SCORING_CONFIG } from '../db';
 export interface CandidateClip {
   title: string;
   hookText: string;
+  hookType: string;
+  contextStatus: ContextStatus;
+  sceneChanges: number;
   startTime: number;
   endTime: number;
   score: number;
@@ -16,26 +20,63 @@ export interface CandidateClip {
   transcriptExcerpt: string;
 }
 
-const HOOK_PATTERNS = [
-  /\b(por qué|cómo|secreto|error|nadie te dice|la verdad|mucha gente|todos piensan|cuidado|problema|mito|realmente)\b/i,
-  /\b(why|how|secret|mistake|nobody tells|the truth|most people|stop doing|here is why|problem|actually)\b/i,
-  /\?/,
-  /\b\d+\b/,
+const HOOK_ARCHETYPES: Array<{ label: string; patterns: RegExp[]; bonus: number }> = [
+  {
+    label: 'Curiosity Gap',
+    patterns: [
+      /\b(nadie te (dice|explica)|esta es la razón|el secreto|lo que nadie|la verdad sobre|mucha gente piensa)\b/i,
+      /\b(nobody tells you|here is why|the secret|what nobody|the truth about|most people think)\b/i,
+    ],
+    bonus: 0.35,
+  },
+  {
+    label: 'Mistake / Lesson',
+    patterns: [
+      /\b(cometí un error|el error que|cuidado con|fracasan|perdí|me costó)\b/i,
+      /\b(i made a mistake|biggest mistake|stop doing|cost me|why .* fail)\b/i,
+    ],
+    bonus: 0.35,
+  },
+  {
+    label: 'Contrarian Claim',
+    patterns: [
+      /\b(no necesitas|olvídate de|mentira|realmente el \d+|en realidad)\b/i,
+      /\b(you don't need|forget about|actually|stop believing)\b/i,
+    ],
+    bonus: 0.3,
+  },
+  {
+    label: 'Direct Question',
+    patterns: [/\?/, /\b(por qué|cómo|qué pasa si|alguna vez)\b/i, /\b(why|how|what if)\b/i],
+    bonus: 0.25,
+  },
+  {
+    label: 'Actionable Framework',
+    patterns: [
+      /\b(paso uno|paso \d+|primero|regla|la clave|estrategia)\b/i,
+      /\b(step one|step \d+|\d+ steps|framework|rule of thumb)\b/i,
+    ],
+    bonus: 0.25,
+  },
 ];
 
 const INFO_PATTERNS = [
-  /\b(paso|arquitectura|sistema|costo|presupuesto|ffmpeg|modelo|pipeline|algoritmo|regla|datos|ejemplo|estructura|ahorrar|gratis|velocidad)\b/i,
-  /\b(step|architecture|system|cost|budget|model|pipeline|algorithm|rule|data|example|framework|save|free|fast|because)\b/i,
+  /\b(paso|arquitectura|sistema|costo|presupuesto|ffmpeg|modelo|pipeline|algoritmo|regla|datos|ejemplo|estructura|ahorrar|gratis|velocidad|token|rúbrica)\b/i,
+  /\b(step|architecture|system|cost|budget|model|pipeline|algorithm|rule|data|example|framework|save|free|fast|because|token|rubric)\b/i,
   /\b(primero|segundo|tercero|entonces|por eso|la clave|significa)\b/i,
 ];
 
 const EMOTION_PATTERNS = [
-  /\b(fracasan|fracaso|imposible|peligroso|increíble|brutal|caro|cero|nunca|siempre|controver|debate|fuerte|sorprendente)\b/i,
-  /\b(fail|failure|impossible|dangerous|incredible|expensive|zero|never|always|controvers|debate|crazy|huge)\b/i,
+  /\b(fracasan|fracaso|imposible|peligroso|increíble|brutal|caro|cero|nunca|siempre|controver|debate|fuerte|sorprendente|error)\b/i,
+  /\b(fail|failure|impossible|dangerous|incredible|expensive|zero|never|always|controvers|debate|crazy|huge|mistake)\b/i,
   /!/,
 ];
 
-const DANGLING_STARTS = /^(y |pero |o |and |but |so |then |entonces |también |also )/i;
+const DANGLING_STARTS =
+  /^(y |pero |o |sin embargo |además |entonces |también |así que |por eso |pues |and |but |so |then |also |therefore |however )/i;
+
+const DANGLING_PRONOUNS =
+  /^(esto |eso |aquello |él |ella |ellos |it |that |this |they |he |she )\b/i;
 
 export function parseSrtOrTextTranscript(
   rawText: string,
@@ -44,7 +85,6 @@ export function parseSrtOrTextTranscript(
   const trimmed = rawText.trim();
   if (!trimmed) return [];
 
-  // Try SRT / VTT timestamp format: 00:00:12,000 --> 00:00:19,000
   const srtBlocks = trimmed.split(/\r?\n\r?\n+/);
   const parsedSrt: TranscriptSegment[] = [];
   const timeRegex =
@@ -80,7 +120,6 @@ export function parseSrtOrTextTranscript(
   }
   if (parsedSrt.length > 0) return parsedSrt;
 
-  // Try simple [MM:SS] or MM:SS lines
   const lineSegments: TranscriptSegment[] = [];
   const simpleLines = trimmed.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   const simpleTimeRegex = /^\[?(\d{1,2}):(\d{2})(?::(\d{2}))?\]?\s*[-–:]?\s*(.+)$/;
@@ -104,13 +143,15 @@ export function parseSrtOrTextTranscript(
       if (i < lineSegments.length - 1) {
         lineSegments[i].end = Math.max(lineSegments[i].start + 1.5, lineSegments[i + 1].start);
       } else {
-        lineSegments[i].end = Math.max(lineSegments[i].start + 4, videoDuration || lineSegments[i].start + 6);
+        lineSegments[i].end = Math.max(
+          lineSegments[i].start + 4,
+          videoDuration || lineSegments[i].start + 6
+        );
       }
     }
     return lineSegments;
   }
 
-  // Fallback: split plain prose into sentences evenly spread over videoDuration
   const sentences = trimmed
     .split(/(?<=[.!?])\s+/)
     .map((s) => s.trim())
@@ -139,38 +180,49 @@ export function parseSrtOrTextTranscript(
 
 export function scoreWindow(
   windowSegs: TranscriptSegment[],
-  config: ScoringConfig = DEFAULT_SCORING_CONFIG
+  config: ScoringConfig = DEFAULT_SCORING_CONFIG,
+  sceneTimestamps: number[] = []
 ): {
   score: number;
   breakdown: ClipScoreBreakdown;
   reason: string;
   title: string;
   hookText: string;
+  hookType: string;
+  contextStatus: ContextStatus;
+  sceneChanges: number;
 } {
-  const firstText = windowSegs[0]?.text ?? '';
+  const firstText = (windowSegs[0]?.text ?? '').trim();
+  const lastText = (windowSegs[windowSegs.length - 1]?.text ?? '').trim();
   const fullText = windowSegs.map((s) => s.text).join(' ');
-  const duration = Math.max(
-    1,
-    (windowSegs[windowSegs.length - 1]?.end ?? 0) - (windowSegs[0]?.start ?? 0)
-  );
+  const startTime = windowSegs[0]?.start ?? 0;
+  const endTime = windowSegs[windowSegs.length - 1]?.end ?? 0;
+  const duration = Math.max(1, endTime - startTime);
 
-  // 1. Hook (0..hookWeight)
-  let hookHits = 0;
-  for (const rx of HOOK_PATTERNS) {
-    if (rx.test(firstText)) hookHits += 1;
+  // 1. Enhanced Hook Detection (0..hookWeight)
+  let hookScoreRatio = 0.25;
+  let hookType = 'Standard Opener';
+  for (const archetype of HOOK_ARCHETYPES) {
+    if (archetype.patterns.some((rx) => rx.test(firstText))) {
+      hookScoreRatio += archetype.bonus;
+      if (hookType === 'Standard Opener') {
+        hookType = archetype.label;
+      }
+    }
   }
-  if (firstText.length >= 28 && firstText.length <= 120) hookHits += 0.6;
-  const hookRatio = Math.min(1, 0.35 + hookHits * 0.25);
-  const hook = Math.round(hookRatio * config.hookWeight);
+  if (/\b\d+\b/.test(firstText)) hookScoreRatio += 0.15;
+  if (firstText.length >= 26 && firstText.length <= 125) hookScoreRatio += 0.15;
+  hookScoreRatio = Math.min(1, hookScoreRatio);
+  const hook = Math.round(hookScoreRatio * config.hookWeight);
 
-  // 2. Info Value (0..infoWeight)
+  // 2. Informational Value (0..infoWeight)
   let infoHits = 0;
   for (const rx of INFO_PATTERNS) {
     if (rx.test(fullText)) infoHits += 1;
   }
   const wordCount = fullText.split(/\s+/).filter(Boolean).length;
-  const densityBonus = wordCount >= 22 ? 0.25 : 0.1;
-  const infoRatio = Math.min(1, 0.3 + infoHits * 0.22 + densityBonus);
+  const densityBonus = wordCount >= 24 ? 0.28 : 0.12;
+  const infoRatio = Math.min(1, 0.25 + infoHits * 0.22 + densityBonus);
   const infoValue = Math.round(infoRatio * config.infoWeight);
 
   // 3. Emotion / Controversy (0..emotionWeight)
@@ -178,17 +230,23 @@ export function scoreWindow(
   for (const rx of EMOTION_PATTERNS) {
     if (rx.test(fullText)) emotionHits += 1;
   }
-  const emotionRatio = Math.min(1, 0.25 + emotionHits * 0.28);
+  const emotionRatio = Math.min(1, 0.2 + emotionHits * 0.3);
   const emotion = Math.round(emotionRatio * config.emotionWeight);
 
-  // 4. Self-Contained Context (0..selfContainedWeight)
+  // 4. Context Independence Check (0..selfContainedWeight)
   let selfRatio = 0.85;
-  if (DANGLING_STARTS.test(firstText)) selfRatio -= 0.28;
-  if (/[.!?]$/.test(windowSegs[windowSegs.length - 1]?.text.trim() ?? '')) {
-    selfRatio += 0.15;
-  }
-  selfRatio = Math.max(0.25, Math.min(1, selfRatio));
+  if (DANGLING_STARTS.test(firstText)) selfRatio -= 0.42;
+  if (DANGLING_PRONOUNS.test(firstText)) selfRatio -= 0.28;
+  if (/[.!?]$/.test(lastText)) selfRatio += 0.15;
+  selfRatio = Math.max(0.15, Math.min(1, selfRatio));
   const selfContained = Math.round(selfRatio * config.selfContainedWeight);
+
+  const contextStatus: ContextStatus =
+    selfRatio >= 0.72
+      ? 'self-contained'
+      : selfRatio >= 0.48
+      ? 'partial'
+      : 'needs-context';
 
   // 5. Duration Fit (0..durationWeight)
   let durationRatio = 0.5;
@@ -197,6 +255,9 @@ export function scoreWindow(
     durationRatio = 0.78;
   else if (duration >= 8) durationRatio = 0.55;
   const durationFit = Math.round(durationRatio * config.durationWeight);
+
+  // Count visual scene changes in range
+  const sceneChanges = sceneTimestamps.filter((t) => t >= startTime && t <= endTime).length;
 
   const rawTotal = hook + infoValue + emotion + selfContained + durationFit;
   const maxPossible =
@@ -209,15 +270,16 @@ export function scoreWindow(
     maxPossible > 0 ? Math.min(100, Math.round((rawTotal / maxPossible) * 100)) : 0;
 
   const reasons: string[] = [];
-  if (hook >= config.hookWeight * 0.7) reasons.push('Strong opening hook');
+  if (hookType !== 'Standard Opener') reasons.push(`${hookType} opening`);
   if (infoValue >= config.infoWeight * 0.7) reasons.push('High informational density');
-  if (emotion >= config.emotionWeight * 0.65) reasons.push('Engaging tension/contrast');
-  if (selfContained >= config.selfContainedWeight * 0.75) reasons.push('Self-contained thought');
+  if (emotion >= config.emotionWeight * 0.65) reasons.push('Strong emotional contrast');
+  if (contextStatus === 'self-contained') reasons.push('Self-contained context');
+  else if (contextStatus === 'needs-context') reasons.push('Starts mid-thought (may need trimming)');
+  if (sceneChanges > 0) reasons.push(`${sceneChanges} visual scene cuts`);
   if (reasons.length === 0) reasons.push('Structured spoken segment');
 
   const words = firstText.replace(/[^\p{L}\p{N}\s]/gu, '').split(/\s+/).filter(Boolean);
-  const shortTitle =
-    words.slice(0, 7).join(' ') + (words.length > 7 ? '...' : '');
+  const shortTitle = words.slice(0, 7).join(' ') + (words.length > 7 ? '...' : '');
 
   return {
     score: normalizedScore,
@@ -225,12 +287,16 @@ export function scoreWindow(
     reason: reasons.join(' · '),
     title: shortTitle || 'Highlight Clip',
     hookText: firstText.slice(0, 120),
+    hookType,
+    contextStatus,
+    sceneChanges,
   };
 }
 
 export function detectCandidateClipsHeuristic(
   segments: TranscriptSegment[],
-  config: ScoringConfig = DEFAULT_SCORING_CONFIG
+  config: ScoringConfig = DEFAULT_SCORING_CONFIG,
+  sceneTimestamps: number[] = []
 ): CandidateClip[] {
   if (segments.length === 0) return [];
 
@@ -253,10 +319,13 @@ export function detectCandidateClipsHeuristic(
       windowSegs.push(nextSeg);
       const currentDur = nextSeg.end - startSeg.start;
       if (currentDur >= minDur) {
-        const evalResult = scoreWindow(windowSegs, config);
+        const evalResult = scoreWindow(windowSegs, config, sceneTimestamps);
         candidates.push({
           title: evalResult.title,
           hookText: evalResult.hookText,
+          hookType: evalResult.hookType,
+          contextStatus: evalResult.contextStatus,
+          sceneChanges: evalResult.sceneChanges,
           startTime: Math.round(startSeg.start * 100) / 100,
           endTime: Math.round(nextSeg.end * 100) / 100,
           score: evalResult.score,
@@ -268,12 +337,14 @@ export function detectCandidateClipsHeuristic(
     }
   }
 
-  // Fallback if total video is shorter than minDur
   if (candidates.length === 0 && segments.length > 0) {
-    const evalResult = scoreWindow(segments, config);
+    const evalResult = scoreWindow(segments, config, sceneTimestamps);
     candidates.push({
       title: evalResult.title,
       hookText: evalResult.hookText,
+      hookType: evalResult.hookType,
+      contextStatus: evalResult.contextStatus,
+      sceneChanges: evalResult.sceneChanges,
       startTime: Math.round(segments[0].start * 100) / 100,
       endTime: Math.round(segments[segments.length - 1].end * 100) / 100,
       score: evalResult.score,
@@ -283,7 +354,6 @@ export function detectCandidateClipsHeuristic(
     });
   }
 
-  // Sort descending by score and deduplicate overlapping intervals (>45% overlap)
   candidates.sort((a, b) => b.score - a.score);
   const selected: CandidateClip[] = [];
   for (const cand of candidates) {

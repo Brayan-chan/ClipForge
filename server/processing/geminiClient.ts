@@ -7,11 +7,13 @@ import type {
 } from '../../src/types';
 import { parseSrtOrTextTranscript, type CandidateClip } from './clipScorer';
 
+const MAX_LLM_CANDIDATES = 4;
+
 function getAiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey) {
     throw new Error(
-      'GEMINI_API_KEY is not configured. Add it in Settings > Secrets, or switch to 0-Cost Deterministic Mode with an SRT/transcript.'
+      'GEMINI_API_KEY is not configured. Add it in Settings > Secrets, or use 0-cost deterministic mode with an SRT/transcript.'
     );
   }
   return new GoogleGenAI({
@@ -28,6 +30,10 @@ export function isGeminiConfigured(): boolean {
   return Boolean(process.env.GEMINI_API_KEY?.trim());
 }
 
+/**
+ * Uses the Gemini Interactions API (`ai.interactions.create`) for `gemini-3.5-transcribe`
+ * per official SDK guidelines, then aligns timestamps from transcript text only.
+ */
 export async function transcribeAudioWithGemini(
   audioPath: string,
   videoDuration: number
@@ -37,97 +43,47 @@ export async function transcribeAudioWithGemini(
   const maxBytes = 18 * 1024 * 1024;
   if (audioBuffer.byteLength > maxBytes) {
     throw new Error(
-      `Extracted audio is ${(audioBuffer.byteLength / (1024 * 1024)).toFixed(1)} MB, exceeding the 18 MB inline limit. Trim the video or provide an SRT transcript.`
+      `Extracted audio is ${(audioBuffer.byteLength / (1024 * 1024)).toFixed(1)} MB, exceeding the 18 MB inline limit. Paste an SRT transcript instead.`
     );
   }
 
   const base64Audio = audioBuffer.toString('base64');
 
-  // Step 1: Verbatim audio transcription using gemini-3.5-transcribe
-  const transcribeResponse = await ai.models.generateContent({
+  const interaction = await ai.interactions.create({
     model: 'gemini-3.5-transcribe',
-    contents: {
-      parts: [
-        {
-          inlineData: {
-            mimeType: 'audio/mp3',
-            data: base64Audio,
-          },
-        },
-        {
-          text: 'Transcribe the spoken audio accurately in its original language.',
-        },
-      ],
-    },
+    input: [
+      {
+        type: 'audio',
+        data: base64Audio,
+        mime_type: 'audio/mp3',
+      },
+      {
+        type: 'text',
+        text: 'Transcribe the spoken audio accurately in its original language, preserving punctuation and speaker turns.',
+      },
+    ],
   });
 
-  const rawTranscript = (transcribeResponse.text ?? '').trim();
+  const rawTranscript = (interaction.output_text ?? '').trim();
   if (!rawTranscript) {
-    throw new Error('Transcription returned empty text. Ensure the video has clear spoken audio.');
+    throw new Error('Transcription returned empty text.');
   }
 
-  // Step 2: Align transcript into clean timestamped segments using gemini-4-hydrogen
-  try {
-    const alignResponse = await ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
-      contents: {
-        parts: [
-          {
-            inlineData: {
-              mimeType: 'audio/mp3',
-              data: base64Audio,
-            },
-          },
-          {
-            text: `Using this verbatim transcript and the audio timing (total duration ${videoDuration.toFixed(1)}s), split the transcript into chronological spoken segments of 3-8 seconds each with accurate start and end timestamps in seconds.\n\nTranscript:\n${rawTranscript}`,
-          },
-        ],
-      },
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              start: { type: Type.NUMBER, description: 'Start timestamp in seconds' },
-              end: { type: Type.NUMBER, description: 'End timestamp in seconds' },
-              text: { type: Type.STRING, description: 'Spoken phrase text' },
-            },
-            required: ['start', 'end', 'text'],
-          },
-        },
-      },
-    });
-
-    const parsed = JSON.parse((alignResponse.text ?? '[]').trim()) as Array<{
-      start: number;
-      end: number;
-      text: string;
-    }>;
-
-    if (Array.isArray(parsed) && parsed.length > 0) {
-      return parsed.map((seg, idx) => ({
-        id: `seg-${idx + 1}`,
-        start: Math.max(0, Math.round(seg.start * 100) / 100),
-        end: Math.min(videoDuration, Math.max(seg.start + 1, Math.round(seg.end * 100) / 100)),
-        text: seg.text.trim(),
-      }));
-    }
-  } catch {
-    // Fallback to sentence-proportional alignment over real duration if alignment JSON fails
-  }
-
+  // Segment text proportionally over real videoDuration without re-sending audio/video
   return parseSrtOrTextTranscript(rawTranscript, videoDuration);
 }
 
+/**
+ * Evaluates ONLY top pre-filtered transcript excerpts (max 4) via `gemini-4-hydrogen`
+ * using structured JSON. Never sends full video files to the LLM.
+ */
 export async function refineCandidatesWithGemini(
   candidates: CandidateClip[],
   config: ScoringConfig
 ): Promise<CandidateClip[]> {
   const ai = getAiClient();
   const qualified = candidates.filter((c) => c.score >= config.llmThreshold);
-  const pool = qualified.length > 0 ? qualified : candidates.slice(0, 4);
+  const pool = (qualified.length > 0 ? qualified : candidates).slice(0, MAX_LLM_CANDIDATES);
   if (pool.length === 0) return [];
 
   const promptPayload = pool.map((c, idx) => ({
@@ -135,12 +91,14 @@ export async function refineCandidatesWithGemini(
     startTime: c.startTime,
     endTime: c.endTime,
     heuristicScore: c.score,
-    transcript: c.transcriptExcerpt,
+    hookType: c.hookType,
+    contextStatus: c.contextStatus,
+    transcript: c.transcriptExcerpt.slice(0, 900),
   }));
 
   const response = await ai.models.generateContent({
     model: 'gemini-4-hydrogen',
-    contents: `Evaluate these pre-filtered video clip candidates for short-form social media (TikTok, Reels, Shorts). Return structured evaluations in the same language as the transcript.
+    contents: `Evaluate these pre-filtered transcript excerpts for short-form social media (TikTok, Reels, Shorts). Return structured evaluations in the same language as the transcript.
 Rubric maximums:
 - hook: 0-${config.hookWeight}
 - infoValue: 0-${config.infoWeight}
@@ -222,7 +180,8 @@ ${JSON.stringify(promptPayload, null, 2)}`,
         config.emotionWeight +
         config.selfContainedWeight +
         config.durationWeight;
-      const score = maxTotal > 0 ? Math.min(100, Math.round((rawTotal / maxTotal) * 100)) : cand.score;
+      const score =
+        maxTotal > 0 ? Math.min(100, Math.round((rawTotal / maxTotal) * 100)) : cand.score;
 
       return {
         ...cand,

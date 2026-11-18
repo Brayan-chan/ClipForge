@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { CheckCircle2, Play, RotateCcw, Save } from 'lucide-react';
 import { TRANSLATIONS, type Language } from '../i18n';
-import type { ClipScoreBreakdown, ScoringConfig, TranscriptSegment } from '../types';
+import type { ClipScoreBreakdown, ContextStatus, ScoringConfig, TranscriptSegment } from '../types';
 import { formatTimecode } from '../utils/format';
 import { LanguageSwitch } from './LanguageSwitch';
 
@@ -15,6 +15,9 @@ interface ScoringLabProps {
 interface LabCandidate {
   title: string;
   hookText: string;
+  hookType?: string;
+  contextStatus?: ContextStatus;
+  sceneChanges?: number;
   startTime: number;
   endTime: number;
   score: number;
@@ -263,9 +266,26 @@ export const ScoringLab: React.FC<ScoringLabProps> = ({
                       <div className="text-sm font-semibold text-slate-900 dark:text-white">
                         {cand.title}
                       </div>
-                      <div className="mt-0.5 font-mono text-xs text-slate-500 dark:text-slate-400 tabular-nums">
-                        {formatTimecode(cand.startTime)} → {formatTimecode(cand.endTime)} ·{' '}
-                        {passesGate ? t.passesGate : t.filteredLocally}
+                      <div className="mt-0.5 flex flex-wrap items-center gap-1.5 font-mono text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                        <span>
+                          {formatTimecode(cand.startTime)} → {formatTimecode(cand.endTime)}
+                        </span>
+                        <span aria-hidden="true">·</span>
+                        <span>{cand.hookType || 'Standard Opener'}</span>
+                        <span aria-hidden="true">·</span>
+                        <span
+                          className={
+                            cand.contextStatus === 'needs-context'
+                              ? 'text-red-500 dark:text-red-400'
+                              : cand.contextStatus === 'partial'
+                              ? 'text-amber-600 dark:text-amber-400'
+                              : 'text-emerald-600 dark:text-emerald-400'
+                          }
+                        >
+                          {t.contextValues[cand.contextStatus ?? 'self-contained']}
+                        </span>
+                        <span aria-hidden="true">·</span>
+                        <span>{passesGate ? t.passesGate : t.filteredLocally}</span>
                       </div>
                     </div>
                     <div className="font-mono text-lg font-bold text-emerald-600 dark:text-emerald-400 tabular-nums">

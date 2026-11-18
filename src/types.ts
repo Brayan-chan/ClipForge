@@ -1,6 +1,7 @@
 export type AspectRatio = '9:16' | '1:1' | '16:9';
 export type FramingMode = 'crop' | 'blur';
 export type ClipStatus = 'candidate' | 'approved' | 'rejected' | 'exported';
+export type ContextStatus = 'self-contained' | 'partial' | 'needs-context';
 export type JobStage =
   | 'queued'
   | 'analyzing_video'
@@ -9,7 +10,8 @@ export type JobStage =
   | 'scoring_moments'
   | 'generating_thumbnails'
   | 'completed'
-  | 'failed';
+  | 'failed'
+  | 'interrupted';
 
 export interface User {
   id: number;
@@ -39,7 +41,7 @@ export interface VideoRecord {
   fps: number;
   hasAudio: boolean;
   sizeBytes: number;
-  status: 'uploaded' | 'processing' | 'ready' | 'error';
+  status: 'uploaded' | 'processing' | 'ready' | 'error' | 'interrupted';
   errorMessage?: string;
   createdAt: string;
 }
@@ -84,6 +86,9 @@ export interface ClipRecord {
   videoId: number;
   title: string;
   hookText: string;
+  hookType?: string;
+  contextStatus?: ContextStatus;
+  sceneChanges?: number;
   startTime: number;
   endTime: number;
   score: number;
@@ -131,6 +136,8 @@ export interface SystemStatus {
   ffprobeAvailable: boolean;
   geminiConfigured: boolean;
   storageBytes: number;
+  activeQueueTasks: number;
+  queuedTasks: number;
   tableCounts: {
     users: number;
     projects: number;

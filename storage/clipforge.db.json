@@ -36,7 +36,7 @@
   ],
   "transcriptions": [
     {
-      "id": 2,
+      "id": 3,
       "videoId": 1,
       "source": "sample",
       "language": "auto",
@@ -78,28 +78,31 @@
           "text": "Paso dos: FFmpeg recorta a formato vertical 9:16, quema subtítulos y exporta tu clip listo!"
         }
       ],
-      "createdAt": "2026-11-18T19:18:17.986Z"
+      "createdAt": "2026-11-18T19:36:32.112Z"
     }
   ],
   "clips": [
     {
-      "id": 2,
+      "id": 4,
       "videoId": 1,
-      "title": "Mucha gente piensa que lanzar un SaaS...",
-      "hookText": "Mucha gente piensa que lanzar un SaaS de clipping de video requiere cinco agentes de IA conversando.",
-      "startTime": 0,
-      "endTime": 17.5,
-      "score": 79,
+      "title": "Por qué fracasan los prototipos caros Porque...",
+      "hookText": "Por qué fracasan los prototipos caros? Porque queman tokens antes de filtrar los mejores momentos.",
+      "hookType": "Mistake / Lesson",
+      "contextStatus": "self-contained",
+      "sceneChanges": 0,
+      "startTime": 11.5,
+      "endTime": 30,
+      "score": 84,
       "breakdown": {
-        "hook": 19,
+        "hook": 25,
         "infoValue": 19,
-        "emotion": 11,
+        "emotion": 10,
         "selfContained": 20,
         "durationFit": 10
       },
-      "reason": "Strong opening hook · High informational density · Self-contained thought",
+      "reason": "Mistake / Lesson opening · High informational density · Self-contained context",
       "scoringSource": "heuristic",
-      "status": "exported",
+      "status": "approved",
       "aspectRatio": "9:16",
       "framingMode": "crop",
       "cropX": 50,
@@ -115,28 +118,30 @@
         "alignment": "center",
         "backgroundBox": true
       },
-      "exportedUrl": "/storage/clips/clip-2-1795029499890.mp4",
-      "srtUrl": "/storage/clips/clip-2-1795029499890.srt",
-      "thumbnailUrl": "/storage/thumbnails/clip-2-1795029499890.jpg",
-      "createdAt": "2026-11-18T19:18:18.196Z",
-      "exportedSizeBytes": 122805
+      "exportedUrl": null,
+      "srtUrl": null,
+      "thumbnailUrl": "/storage/thumbnails/clip-4-preview.jpg",
+      "createdAt": "2026-11-18T19:36:32.521Z"
     },
     {
-      "id": 3,
+      "id": 5,
       "videoId": 1,
-      "title": "Por qué fracasan los prototipos caros Porque...",
-      "hookText": "Por qué fracasan los prototipos caros? Porque queman tokens antes de filtrar los mejores momentos.",
-      "startTime": 11.5,
-      "endTime": 30,
-      "score": 79,
+      "title": "Mucha gente piensa que lanzar un SaaS...",
+      "hookText": "Mucha gente piensa que lanzar un SaaS de clipping de video requiere cinco agentes de IA conversando.",
+      "hookType": "Curiosity Gap",
+      "contextStatus": "self-contained",
+      "sceneChanges": 0,
+      "startTime": 0,
+      "endTime": 17.5,
+      "score": 78,
       "breakdown": {
         "hook": 19,
         "infoValue": 19,
-        "emotion": 11,
+        "emotion": 10,
         "selfContained": 20,
         "durationFit": 10
       },
-      "reason": "Strong opening hook · High informational density · Self-contained thought",
+      "reason": "Curiosity Gap opening · High informational density · Self-contained context",
       "scoringSource": "heuristic",
       "status": "candidate",
       "aspectRatio": "9:16",
@@ -156,8 +161,8 @@
       },
       "exportedUrl": null,
       "srtUrl": null,
-      "thumbnailUrl": "/storage/thumbnails/clip-3-preview.jpg",
-      "createdAt": "2026-11-18T19:18:18.375Z"
+      "thumbnailUrl": "/storage/thumbnails/clip-5-preview.jpg",
+      "createdAt": "2026-11-18T19:36:32.521Z"
     }
   ],
   "processingJobs": [
@@ -180,6 +185,16 @@
       "message": "Pipeline complete: 2 clips detected and scored.",
       "useAi": false,
       "updatedAt": "2026-11-18T19:18:18.376Z"
+    },
+    {
+      "id": 3,
+      "projectId": 1,
+      "videoId": 1,
+      "stage": "completed",
+      "progress": 100,
+      "message": "Pipeline complete: 2 clips detected.",
+      "useAi": false,
+      "updatedAt": "2026-11-18T19:36:32.521Z"
     }
   ],
   "scoringConfig": {
@@ -196,8 +211,8 @@
     "user": 2,
     "project": 2,
     "video": 2,
-    "transcription": 3,
-    "clip": 4,
-    "job": 3
+    "transcription": 4,
+    "clip": 6,
+    "job": 4
   }
 }

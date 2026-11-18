@@ -162,6 +162,19 @@ export function App() {
     await fetchWorkspace();
   };
 
+  const handleRetryVideo = async (videoId: number) => {
+    const res = await fetch(`/api/videos/${videoId}/retry`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ useAi: false }),
+    });
+    if (res.ok) {
+      const data = (await res.json()) as { job: ProcessingJob };
+      setTrackedJobId(data.job.id);
+      await fetchWorkspace();
+    }
+  };
+
   const handleUpdateClip = async (clipId: number, patch: Partial<ClipRecord>): Promise<ClipRecord> => {
     const res = await fetch(`/api/clips/${clipId}`, {
       method: 'PATCH',
@@ -284,6 +297,7 @@ export function App() {
           onGenerateDemo={handleGenerateDemo}
           onOpenStudio={handleOpenStudio}
           onDeleteVideo={handleDeleteVideo}
+          onRetryVideo={handleRetryVideo}
           onCompileClip={async (id) => {
             await handleCompileClip(id);
           }}

@@ -7,6 +7,7 @@ import {
   FolderPlus,
   Loader2,
   Play,
+  RotateCcw,
   Scissors,
   Search,
   Trash2,
@@ -27,6 +28,7 @@ interface ProjectsDashboardProps {
   onGenerateDemo: () => Promise<void>;
   onOpenStudio: (videoId: number, clipId?: number) => void;
   onDeleteVideo: (videoId: number) => Promise<void>;
+  onRetryVideo: (videoId: number) => Promise<void>;
   onCompileClip: (clipId: number) => Promise<void>;
   onCreateProject: (name: string) => Promise<void>;
   lang: Language;
@@ -42,6 +44,7 @@ export const ProjectsDashboard: React.FC<ProjectsDashboardProps> = ({
   onGenerateDemo,
   onOpenStudio,
   onDeleteVideo,
+  onRetryVideo,
   onCompileClip,
   onCreateProject,
   lang,
@@ -55,6 +58,7 @@ export const ProjectsDashboard: React.FC<ProjectsDashboardProps> = ({
   const [searchQuery, setSearchQuery] = useState('');
   const [detailVideoId, setDetailVideoId] = useState<number | null>(null);
   const [isDemoLoading, setIsDemoLoading] = useState(false);
+  const [retryingVideoId, setRetryingVideoId] = useState<number | null>(null);
   const [compilingClipId, setCompilingClipId] = useState<number | null>(null);
   const [newProjectName, setNewProjectName] = useState('');
   const [showNewProject, setShowNewProject] = useState(false);
@@ -113,6 +117,15 @@ export const ProjectsDashboard: React.FC<ProjectsDashboardProps> = ({
       await onCompileClip(clipId);
     } finally {
       setCompilingClipId(null);
+    }
+  };
+
+  const handleRetry = async (videoId: number) => {
+    setRetryingVideoId(videoId);
+    try {
+      await onRetryVideo(videoId);
+    } finally {
+      setRetryingVideoId(null);
     }
   };
 
@@ -375,6 +388,12 @@ export const ProjectsDashboard: React.FC<ProjectsDashboardProps> = ({
                           </span>
                         </span>
                       )}
+                      {video.status === 'interrupted' && (
+                        <span className="inline-flex items-center gap-1.5 text-xs font-medium text-amber-600 dark:text-amber-400">
+                          <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+                          <span className="line-clamp-1">{t.interruptedStatus}</span>
+                        </span>
+                      )}
                       {video.status === 'error' && (
                         <span className="inline-flex items-center gap-1.5 text-xs font-medium text-red-600 dark:text-red-400">
                           <AlertCircle className="h-3.5 w-3.5 shrink-0" />
@@ -386,15 +405,31 @@ export const ProjectsDashboard: React.FC<ProjectsDashboardProps> = ({
 
                   <div className="flex items-center justify-between gap-2 border-t border-slate-100 pt-3 dark:border-white/5">
                     <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => onOpenStudio(video.id, videoClips[0]?.id)}
-                        disabled={video.status === 'processing'}
-                        className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-semibold text-slate-950 transition-colors hover:bg-emerald-400 disabled:opacity-40 whitespace-nowrap shrink-0"
-                      >
-                        <Scissors className="h-3.5 w-3.5" />
-                        <span>{t.openStudio}</span>
-                      </button>
+                      {(video.status === 'interrupted' || video.status === 'error') ? (
+                        <button
+                          type="button"
+                          disabled={retryingVideoId === video.id}
+                          onClick={() => handleRetry(video.id)}
+                          className="inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-semibold text-slate-950 transition-colors hover:bg-amber-400 disabled:opacity-50 whitespace-nowrap shrink-0"
+                        >
+                          {retryingVideoId === video.id ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <RotateCcw className="h-3.5 w-3.5" />
+                          )}
+                          <span>{t.retry}</span>
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => onOpenStudio(video.id, videoClips[0]?.id)}
+                          disabled={video.status === 'processing'}
+                          className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-semibold text-slate-950 transition-colors hover:bg-emerald-400 disabled:opacity-40 whitespace-nowrap shrink-0"
+                        >
+                          <Scissors className="h-3.5 w-3.5" />
+                          <span>{t.openStudio}</span>
+                        </button>
+                      )}
 
                       <button
                         type="button"

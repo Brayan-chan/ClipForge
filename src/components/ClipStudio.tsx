@@ -960,6 +960,35 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                   })}
                 </div>
 
+                <div className="space-y-2 border-t border-slate-200 pt-4 dark:border-white/10 text-xs">
+                  <div className="flex items-center justify-between">
+                    <span className="text-slate-500 dark:text-slate-400">{t.hookTypeLabel}</span>
+                    <span className="font-medium text-slate-900 dark:text-white">
+                      {draft.hookType || 'Standard Opener'}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-slate-500 dark:text-slate-400">{t.contextLabel}</span>
+                    <span
+                      className={`font-medium ${
+                        draft.contextStatus === 'needs-context'
+                          ? 'text-red-600 dark:text-red-400'
+                          : draft.contextStatus === 'partial'
+                          ? 'text-amber-600 dark:text-amber-400'
+                          : 'text-emerald-600 dark:text-emerald-400'
+                      }`}
+                    >
+                      {t.contextValues[draft.contextStatus ?? 'self-contained']}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-slate-500 dark:text-slate-400">{t.sceneCutsLabel}</span>
+                    <span className="font-mono font-medium text-slate-900 dark:text-white tabular-nums">
+                      {draft.sceneChanges ?? 0}
+                    </span>
+                  </div>
+                </div>
+
                 <div className="space-y-1.5 border-t border-slate-200 pt-4 dark:border-white/10">
                   <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
                     {t.rationale} ({draft.scoringSource})

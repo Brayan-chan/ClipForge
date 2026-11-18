@@ -101,13 +101,22 @@ function createInitialDb(): DatabaseSchema {
 }
 
 let cachedDb: DatabaseSchema | null = null;
+let writeMutex: Promise<void> = Promise.resolve();
+
+function atomicWriteSync(db: DatabaseSchema): void {
+  ensureStorageDirs();
+  const tmpFile = `${DB_FILE}.tmp.${process.pid}`;
+  const payload = JSON.stringify(db, null, 2);
+  fs.writeFileSync(tmpFile, payload, 'utf-8');
+  fs.renameSync(tmpFile, DB_FILE);
+}
 
 export function readDb(): DatabaseSchema {
   ensureStorageDirs();
   if (cachedDb) return cachedDb;
   if (!fs.existsSync(DB_FILE)) {
     const initial = createInitialDb();
-    fs.writeFileSync(DB_FILE, JSON.stringify(initial, null, 2), 'utf-8');
+    atomicWriteSync(initial);
     cachedDb = initial;
     return cachedDb;
   }
@@ -121,16 +130,65 @@ export function readDb(): DatabaseSchema {
     return cachedDb;
   } catch {
     const initial = createInitialDb();
-    fs.writeFileSync(DB_FILE, JSON.stringify(initial, null, 2), 'utf-8');
+    atomicWriteSync(initial);
     cachedDb = initial;
     return cachedDb;
   }
 }
 
 export function writeDb(db: DatabaseSchema): void {
-  ensureStorageDirs();
   cachedDb = db;
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), 'utf-8');
+  atomicWriteSync(db);
+}
+
+/**
+ * Serializes mutations across concurrent async requests and writes atomically.
+ */
+export async function mutateDb<T>(mutator: (db: DatabaseSchema) => T | Promise<T>): Promise<T> {
+  let result!: T;
+  const run = async () => {
+    const db = readDb();
+    result = await mutator(db);
+    writeDb(db);
+  };
+  writeMutex = writeMutex.then(run, run);
+  await writeMutex;
+  return result;
+}
+
+/**
+ * Detects jobs & videos left in 'processing' state from an unexpected shutdown
+ * and marks them 'interrupted' so users can retry cleanly.
+ */
+export function recoverInterruptedJobs(): number {
+  const db = readDb();
+  let recovered = 0;
+
+  for (const job of db.processingJobs) {
+    if (
+      job.stage !== 'completed' &&
+      job.stage !== 'failed' &&
+      job.stage !== 'interrupted'
+    ) {
+      job.stage = 'interrupted';
+      job.message = 'Task interrupted by server restart. Click Retry to resume.';
+      job.updatedAt = new Date().toISOString();
+      recovered++;
+    }
+  }
+
+  for (const video of db.videos) {
+    if (video.status === 'processing') {
+      video.status = 'interrupted';
+      video.errorMessage = 'Processing interrupted by restart. Ready to retry.';
+      recovered++;
+    }
+  }
+
+  if (recovered > 0) {
+    writeDb(db);
+  }
+  return recovered;
 }
 
 export function getStorageUsageBytes(): number {
