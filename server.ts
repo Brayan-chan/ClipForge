@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createServer as createViteServer } from 'vite';
@@ -8,6 +9,7 @@ import type { ClipRecord, ScoringConfig, TranscriptSegment } from './src/types';
 import {
   CLIPS_DIR,
   DEFAULT_SUBTITLE_STYLE,
+  STORAGE_ROOT,
   THUMBNAILS_DIR,
   TRANSCRIPTS_DIR,
   UPLOADS_DIR,
@@ -103,6 +105,115 @@ const srtUpload = multer({
     cb(null, true);
   },
 });
+
+const CHUNKS_DIR = path.join(STORAGE_ROOT, '.chunks');
+const UPLOAD_CHUNK_BYTES = 5 * 1024 * 1024; // 5 MB chunks stay safely under proxy limits
+
+interface ChunkUploadSession {
+  uploadId: string;
+  safeFilename: string;
+  originalName: string;
+  tempPath: string;
+  expectedSizeBytes: number;
+  receivedBytes: number;
+  title: string;
+  projectId: number;
+  useAi: boolean;
+  transcriptText: string;
+  createdAtMs: number;
+}
+
+const chunkUploadSessions = new Map<string, ChunkUploadSession>();
+
+function cleanupExpiredChunkSessions(): void {
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  for (const [id, session] of chunkUploadSessions.entries()) {
+    if (session.createdAtMs < cutoff) {
+      safeUnlink(session.tempPath);
+      chunkUploadSessions.delete(id);
+    }
+  }
+}
+
+async function finalizeUploadedVideo(params: {
+  filePath: string;
+  filename: string;
+  originalName: string;
+  sizeBytes: number;
+  title: string;
+  projectId: number;
+  useAi: boolean;
+  transcriptText: string;
+}) {
+  let videoMeta;
+  try {
+    videoMeta = await analyzeVideo(params.filePath);
+  } catch (probeErr) {
+    safeUnlink(params.filePath);
+    const err = new Error(
+      probeErr instanceof Error ? probeErr.message : 'Invalid or corrupted video file.'
+    ) as Error & { statusCode?: number };
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const { video, job } = await mutateDb((db) => {
+    const videoId = db.nextIds.video++;
+    const v = {
+      id: videoId,
+      projectId: params.projectId,
+      title: params.title,
+      filename: params.filename,
+      originalName: path.basename(params.originalName),
+      fileUrl: `/storage/uploads/${params.filename}`,
+      thumbnailUrl: null as string | null,
+      duration: videoMeta.duration,
+      width: videoMeta.width,
+      height: videoMeta.height,
+      fps: videoMeta.fps,
+      hasAudio: videoMeta.hasAudio,
+      sizeBytes: params.sizeBytes,
+      status: 'processing' as const,
+      createdAt: new Date().toISOString(),
+    };
+    db.videos.push(v);
+
+    const jobId = db.nextIds.job++;
+    const j = {
+      id: jobId,
+      projectId: params.projectId,
+      videoId,
+      stage: 'queued' as const,
+      progress: 10,
+      message: 'Video validated & queued for sequential processing...',
+      useAi: params.useAi,
+      updatedAt: new Date().toISOString(),
+    };
+    db.processingJobs.push(j);
+    return { video: v, job: j };
+  });
+
+  const thumbUrl = await generateThumbnail(
+    params.filePath,
+    `video-${video.id}-cover.jpg`,
+    Math.min(2, Math.max(0.2, videoMeta.duration * 0.15))
+  );
+  if (thumbUrl) {
+    await mutateDb((db) => {
+      const target = db.videos.find((item) => item.id === video.id);
+      if (target) target.thumbnailUrl = thumbUrl;
+    });
+  }
+
+  void runVideoPipeline({
+    videoId: video.id,
+    jobId: job.id,
+    useAi: params.useAi,
+    suppliedTranscript: params.transcriptText,
+  });
+
+  return { video, job };
+}
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, service: 'clipforge' });
@@ -247,89 +358,167 @@ app.post('/api/videos/upload', upload.single('video'), async (req, res) => {
       return;
     }
 
-    let videoMeta;
-    try {
-      videoMeta = await analyzeVideo(req.file.path);
-    } catch (probeErr) {
-      safeUnlink(req.file.path);
-      res.status(400).json({
-        error:
-          probeErr instanceof Error
-            ? probeErr.message
-            : 'Invalid or corrupted video file.',
-      });
-      return;
-    }
-
     const title =
       (req.body.title as string | undefined)?.trim().slice(0, 120) ||
       req.file.originalname.replace(/\.[^.]+$/, '');
     const projectId = Number(req.body.projectId) || 1;
-    // Gemini disabled by default
     const useAi = req.body.useAi === 'true' || req.body.useAi === true;
     const transcriptText = (req.body.transcriptText as string | undefined) ?? '';
 
-    const { video, job } = await mutateDb((db) => {
-      const videoId = db.nextIds.video++;
-      const v = {
-        id: videoId,
-        projectId,
-        title,
-        filename: req.file!.filename,
-        originalName: path.basename(req.file!.originalname),
-        fileUrl: `/storage/uploads/${req.file!.filename}`,
-        thumbnailUrl: null as string | null,
-        duration: videoMeta.duration,
-        width: videoMeta.width,
-        height: videoMeta.height,
-        fps: videoMeta.fps,
-        hasAudio: videoMeta.hasAudio,
-        sizeBytes: req.file!.size,
-        status: 'processing' as const,
-        createdAt: new Date().toISOString(),
-      };
-      db.videos.push(v);
-
-      const jobId = db.nextIds.job++;
-      const j = {
-        id: jobId,
-        projectId,
-        videoId,
-        stage: 'queued' as const,
-        progress: 10,
-        message: 'Video validated & queued for sequential processing...',
-        useAi,
-        updatedAt: new Date().toISOString(),
-      };
-      db.processingJobs.push(j);
-      return { video: v, job: j };
-    });
-
-    const thumbUrl = await generateThumbnail(
-      req.file.path,
-      `video-${video.id}-cover.jpg`,
-      Math.min(2, Math.max(0.2, videoMeta.duration * 0.15))
-    );
-    if (thumbUrl) {
-      await mutateDb((db) => {
-        const target = db.videos.find((item) => item.id === video.id);
-        if (target) target.thumbnailUrl = thumbUrl;
-      });
-    }
-
-    void runVideoPipeline({
-      videoId: video.id,
-      jobId: job.id,
+    const result = await finalizeUploadedVideo({
+      filePath: req.file.path,
+      filename: req.file.filename,
+      originalName: req.file.originalname,
+      sizeBytes: req.file.size,
+      title,
+      projectId,
       useAi,
-      suppliedTranscript: transcriptText,
+      transcriptText,
     });
 
-    res.status(201).json({ video, job });
+    res.status(201).json(result);
   } catch (err) {
     if (req.file?.path) safeUnlink(req.file.path);
+    const statusCode = (err as { statusCode?: number }).statusCode ?? 500;
     const message = err instanceof Error ? err.message : 'Upload failed';
-    res.status(500).json({ error: message });
+    res.status(statusCode).json({ error: message });
   }
+});
+
+app.post('/api/videos/upload/init', (req, res) => {
+  cleanupExpiredChunkSessions();
+  const {
+    filename,
+    mimetype = 'video/mp4',
+    sizeBytes,
+    title,
+    projectId,
+    useAi = false,
+    transcriptText = '',
+  } = req.body as {
+    filename?: string;
+    mimetype?: string;
+    sizeBytes?: number;
+    title?: string;
+    projectId?: number;
+    useAi?: boolean;
+    transcriptText?: string;
+  };
+
+  if (!filename || typeof sizeBytes !== 'number' || sizeBytes <= 0) {
+    res.status(400).json({ error: 'Invalid upload metadata.' });
+    return;
+  }
+
+  const check = validateUploadedFileMeta({
+    originalname: filename,
+    mimetype,
+    size: sizeBytes,
+  });
+  if (!check.valid) {
+    res.status(400).json({ error: check.error });
+    return;
+  }
+
+  fs.mkdirSync(CHUNKS_DIR, { recursive: true });
+  const uploadId = crypto.randomUUID();
+  const safeFilename = generateSafeMediaFilename(filename);
+  const tempPath = path.join(CHUNKS_DIR, `${uploadId}.part`);
+  fs.writeFileSync(tempPath, Buffer.alloc(0));
+
+  chunkUploadSessions.set(uploadId, {
+    uploadId,
+    safeFilename,
+    originalName: path.basename(filename),
+    tempPath,
+    expectedSizeBytes: sizeBytes,
+    receivedBytes: 0,
+    title:
+      (title ?? '').trim().slice(0, 120) ||
+      path.basename(filename).replace(/\.[^.]+$/, ''),
+    projectId: Number(projectId) || 1,
+    useAi: useAi === true,
+    transcriptText: typeof transcriptText === 'string' ? transcriptText : '',
+    createdAtMs: Date.now(),
+  });
+
+  res.status(201).json({ uploadId, chunkSizeBytes: UPLOAD_CHUNK_BYTES });
+});
+
+app.post(
+  '/api/videos/upload/chunk/:uploadId',
+  express.raw({ type: 'application/octet-stream', limit: '8mb' }),
+  (req, res) => {
+    const session = chunkUploadSessions.get(req.params.uploadId);
+    if (!session) {
+      res.status(404).json({ error: 'Upload session not found or expired.' });
+      return;
+    }
+
+    const chunk = req.body;
+    if (!Buffer.isBuffer(chunk) || chunk.length === 0) {
+      res.status(400).json({ error: 'Empty upload chunk.' });
+      return;
+    }
+
+    if (session.receivedBytes + chunk.length > MAX_VIDEO_SIZE_BYTES) {
+      safeUnlink(session.tempPath);
+      chunkUploadSessions.delete(session.uploadId);
+      res.status(400).json({ error: 'Video exceeds maximum 250 MB limit.' });
+      return;
+    }
+
+    fs.appendFileSync(session.tempPath, chunk);
+    session.receivedBytes += chunk.length;
+    res.json({ ok: true, receivedBytes: session.receivedBytes });
+  }
+);
+
+app.post('/api/videos/upload/complete/:uploadId', async (req, res) => {
+  const session = chunkUploadSessions.get(req.params.uploadId);
+  if (!session) {
+    res.status(404).json({ error: 'Upload session not found or expired.' });
+    return;
+  }
+  chunkUploadSessions.delete(session.uploadId);
+
+  if (session.receivedBytes === 0 || !fs.existsSync(session.tempPath)) {
+    safeUnlink(session.tempPath);
+    res.status(400).json({ error: 'No video bytes were uploaded.' });
+    return;
+  }
+
+  ensureStorageDirs();
+  const finalPath = path.join(UPLOADS_DIR, session.safeFilename);
+  try {
+    fs.renameSync(session.tempPath, finalPath);
+    const result = await finalizeUploadedVideo({
+      filePath: finalPath,
+      filename: session.safeFilename,
+      originalName: session.originalName,
+      sizeBytes: session.receivedBytes,
+      title: session.title,
+      projectId: session.projectId,
+      useAi: session.useAi,
+      transcriptText: session.transcriptText,
+    });
+    res.status(201).json(result);
+  } catch (err) {
+    safeUnlink(session.tempPath);
+    safeUnlink(finalPath);
+    const statusCode = (err as { statusCode?: number }).statusCode ?? 500;
+    const message = err instanceof Error ? err.message : 'Failed to finalize uploaded video.';
+    res.status(statusCode).json({ error: message });
+  }
+});
+
+app.delete('/api/videos/upload/:uploadId', (req, res) => {
+  const session = chunkUploadSessions.get(req.params.uploadId);
+  if (session) {
+    safeUnlink(session.tempPath);
+    chunkUploadSessions.delete(session.uploadId);
+  }
+  res.json({ ok: true });
 });
 
 app.post('/api/videos/:id/retry', async (req, res) => {

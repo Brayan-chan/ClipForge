@@ -6,6 +6,7 @@ import { ScoringLab } from './components/ScoringLab';
 import { PipelineView } from './components/PipelineView';
 import { UploadModal } from './components/UploadModal';
 import type { Language } from './i18n';
+import { readJsonResponse } from './utils/http';
 import type {
   ClipRecord,
   ProcessingJob,
@@ -181,22 +182,16 @@ export function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch),
     });
-    const updated = (await res.json()) as ClipRecord;
-    if (!res.ok) {
-      throw new Error((updated as unknown as { error?: string }).error || 'Update failed');
-    }
+    const updated = await readJsonResponse<ClipRecord>(res);
     await fetchWorkspace();
     return updated;
   };
 
   const handleCompileClip = async (clipId: number): Promise<ClipRecord> => {
     const res = await fetch(`/api/clips/${clipId}/compile`, { method: 'POST' });
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.error || 'FFmpeg compile failed');
-    }
+    const data = await readJsonResponse<ClipRecord>(res);
     await fetchWorkspace();
-    return data as ClipRecord;
+    return data;
   };
 
   const handleRescoreClip = async (clipId: number, useAi: boolean): Promise<ClipRecord> => {
@@ -205,12 +200,9 @@ export function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ useAi }),
     });
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.error || 'Rescore failed');
-    }
+    const data = await readJsonResponse<ClipRecord>(res);
     await fetchWorkspace();
-    return data as ClipRecord;
+    return data;
   };
 
   const handleCreateClip = async (
@@ -223,7 +215,7 @@ export function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ videoId, startTime, endTime }),
     });
-    const created = (await res.json()) as ClipRecord;
+    const created = await readJsonResponse<ClipRecord>(res);
     await fetchWorkspace();
     return created;
   };
@@ -242,10 +234,7 @@ export function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ segments }),
     });
-    if (!res.ok) {
-      const data = await res.json();
-      throw new Error(data.error || 'Failed to save transcript');
-    }
+    await readJsonResponse(res);
     await fetchWorkspace();
   };
 
@@ -259,10 +248,10 @@ export function App() {
       method: 'POST',
       body: form,
     });
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.error || 'Failed to import SRT file');
-    }
+    const data = await readJsonResponse<{
+      importedCount?: number;
+      transcription?: TranscriptionRecord;
+    }>(res);
     await fetchWorkspace();
     return { importedCount: data.importedCount ?? data.transcription?.segments?.length ?? 0 };
   };

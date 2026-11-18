@@ -90,6 +90,8 @@ export const TRANSLATIONS = {
       errInvalidSrt: 'Please select a valid .srt file (under 2 MB) with subtitle blocks.',
       transcriptPlaceholder: 'Paste .srt blocks, [MM:SS] lines, or plain spoken text (or drop a .srt file)...',
       startPipeline: 'Start Clipping Pipeline',
+      uploadingProgress: 'Uploading video chunks',
+      errTooLarge: 'File exceeds the 250 MB maximum limit.',
       errNoFile: 'Select a video file (.mp4, .mov, .webm, .mkv) first.',
       errNoTranscript:
         'In 0-Cost Deterministic Mode, import/paste an SRT or transcript below, or switch to Gemini AI Transcription.',
@@ -335,6 +337,8 @@ export const TRANSLATIONS = {
       errInvalidSrt: 'Selecciona un archivo .srt válido (menor a 2 MB) con bloques de subtítulos.',
       transcriptPlaceholder: 'Pega bloques .srt, líneas [MM:SS] o texto continuo (o arrastra un archivo .srt)...',
       startPipeline: 'Iniciar Pipeline de Clipping',
+      uploadingProgress: 'Subiendo video por partes',
+      errTooLarge: 'El archivo supera el límite máximo de 250 MB.',
       errNoFile: 'Primero selecciona un archivo de video (.mp4, .mov, .webm, .mkv).',
       errNoTranscript:
         'En modo determinista de costo $0, importa o pega un archivo SRT/transcripción abajo, o cambia a Transcripción con Gemini AI.',

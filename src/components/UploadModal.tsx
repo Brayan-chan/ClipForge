@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { TRANSLATIONS, type Language } from '../i18n';
 import type { ProcessingJob, Project } from '../types';
+import { readJsonResponse } from '../utils/http';
 
 interface UploadModalProps {
   isOpen: boolean;
@@ -54,6 +55,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
   const [mode, setMode] = useState<'heuristic' | 'ai'>('heuristic');
   const [transcriptText, setTranscriptText] = useState('');
   const [srtFilename, setSrtFilename] = useState<string | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -96,36 +98,70 @@ export const UploadModal: React.FC<UploadModalProps> = ({
       setError(t.errNoFile);
       return;
     }
+    if (selectedFile.size > 250 * 1024 * 1024) {
+      setError(t.errTooLarge);
+      return;
+    }
     if (mode === 'heuristic' && !transcriptText.trim()) {
       setError(t.errNoTranscript);
       return;
     }
 
     setIsSubmitting(true);
+    setUploadProgress(0);
     setError(null);
+    let uploadId: string | null = null;
+
     try {
-      const form = new FormData();
-      form.append('video', selectedFile);
-      form.append('title', title.trim() || selectedFile.name);
-      form.append('projectId', String(projectId));
-      form.append('useAi', String(mode === 'ai'));
-      if (transcriptText.trim()) {
-        form.append('transcriptText', transcriptText.trim());
+      const initRes = await fetch('/api/videos/upload/init', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filename: selectedFile.name,
+          mimetype: selectedFile.type || 'video/mp4',
+          sizeBytes: selectedFile.size,
+          title: title.trim() || selectedFile.name,
+          projectId,
+          useAi: mode === 'ai',
+          transcriptText: transcriptText.trim(),
+        }),
+      });
+      const initData = await readJsonResponse<{ uploadId: string; chunkSizeBytes: number }>(
+        initRes
+      );
+      uploadId = initData.uploadId;
+      const chunkSize = initData.chunkSizeBytes || 5 * 1024 * 1024;
+
+      let offset = 0;
+      while (offset < selectedFile.size) {
+        const end = Math.min(selectedFile.size, offset + chunkSize);
+        const slice = selectedFile.slice(offset, end);
+        const chunkRes = await fetch(`/api/videos/upload/chunk/${uploadId}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: slice,
+        });
+        await readJsonResponse(chunkRes);
+        offset = end;
+        setUploadProgress(Math.min(99, Math.round((offset / selectedFile.size) * 100)));
       }
 
-      const res = await fetch('/api/videos/upload', {
+      const completeRes = await fetch(`/api/videos/upload/complete/${uploadId}`, {
         method: 'POST',
-        body: form,
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Upload failed');
-      }
+      const data = await readJsonResponse<{ video: { id: number }; job: ProcessingJob }>(
+        completeRes
+      );
+      setUploadProgress(100);
       onVideoCreated(data.video.id, data.job);
     } catch (err) {
+      if (uploadId) {
+        void fetch(`/api/videos/upload/${uploadId}`, { method: 'DELETE' });
+      }
       setError(err instanceof Error ? err.message : 'Upload failed');
     } finally {
       setIsSubmitting(false);
+      setUploadProgress(null);
     }
   };
 
@@ -141,10 +177,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
           useAi: mode === 'ai' && geminiConfigured,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to generate demo video');
-      }
+      const data = await readJsonResponse<{ video: { id: number }; job: ProcessingJob }>(res);
       onVideoCreated(data.video.id, data.job);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load demo video');
@@ -174,6 +207,24 @@ export const UploadModal: React.FC<UploadModalProps> = ({
         </div>
 
         <div className="max-h-[82vh] overflow-y-auto p-6 space-y-5">
+          {uploadProgress !== null && (
+            <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-4">
+              <div className="flex items-center justify-between text-sm font-medium text-emerald-700 dark:text-emerald-300">
+                <span className="flex items-center gap-2">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  <span>{t.uploadingProgress}...</span>
+                </span>
+                <span className="font-mono tabular-nums">{uploadProgress}%</span>
+              </div>
+              <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-emerald-950/30">
+                <div
+                  className="h-full bg-emerald-500 transition-all duration-200"
+                  style={{ width: `${uploadProgress}%` }}
+                />
+              </div>
+            </div>
+          )}
+
           {activeJob && activeJob.stage !== 'completed' && activeJob.stage !== 'failed' && (
             <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-4">
               <div className="flex items-center justify-between text-sm font-medium text-emerald-700 dark:text-emerald-300">
