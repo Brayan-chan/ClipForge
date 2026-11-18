@@ -1,4 +1,3 @@
-import path from 'node:path';
 import type {
   ClipRecord,
   JobStage,
@@ -6,9 +5,9 @@ import type {
 } from '../src/types';
 import {
   DEFAULT_SUBTITLE_STYLE,
-  UPLOADS_DIR,
   mutateDb,
   readDb,
+  resolveVideoInputSource,
 } from './db';
 import { processingQueue } from './queue';
 import { extractMonoAudio } from './processing/audioExtractor';
@@ -75,7 +74,7 @@ export async function runVideoPipeline(params: {
         }
       });
 
-      const videoPath = path.join(UPLOADS_DIR, initialVideo.filename);
+      const videoPath = resolveVideoInputSource(initialVideo);
 
       // Stage 1: Stream metadata + visual scene change detection
       await updateJob(

@@ -210,9 +210,9 @@
   "nextIds": {
     "user": 2,
     "project": 2,
-    "video": 3,
-    "transcription": 5,
-    "clip": 7,
-    "job": 5
+    "video": 6,
+    "transcription": 8,
+    "clip": 10,
+    "job": 8
   }
 }

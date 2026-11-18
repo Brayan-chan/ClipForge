@@ -498,7 +498,11 @@ export const ProjectsDashboard: React.FC<ProjectsDashboardProps> = ({
                     </span>
                     <span className="text-slate-500 dark:text-slate-400">{t.modalSize}</span>
                     <span className="font-mono text-slate-900 dark:text-white tabular-nums">
-                      {formatBytes(detailVideo.sizeBytes)}
+                      {detailVideo.sizeBytes > 0
+                        ? formatBytes(detailVideo.sizeBytes)
+                        : detailVideo.sourceUrl
+                        ? t.remoteStream
+                        : formatBytes(0)}
                     </span>
                   </div>
                 </div>

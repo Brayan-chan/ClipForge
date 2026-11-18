@@ -5,6 +5,7 @@ import {
   Cpu,
   FileText,
   Film,
+  Link2,
   Loader2,
   Sparkles,
   Upload,
@@ -12,13 +13,16 @@ import {
 } from 'lucide-react';
 import { TRANSLATIONS, type Language } from '../i18n';
 import type { ProcessingJob, Project } from '../types';
-import { readJsonResponse } from '../utils/http';
+import { formatBytes } from '../utils/format';
+import { ApiError, readJsonResponse } from '../utils/http';
 
 interface UploadModalProps {
   isOpen: boolean;
   onClose: () => void;
   projects: Project[];
   geminiConfigured: boolean;
+  maxUploadSizeBytes?: number;
+  objectStorageConfigured?: boolean;
   onVideoCreated: (videoId: number, job: ProcessingJob) => void;
   activeJob: ProcessingJob | null;
   lang: Language;
@@ -37,11 +41,39 @@ Mucha gente piensa que lanzar un SaaS de clipping requiere cinco agentes de IA c
 Pero realmente FFmpeg y una rúbrica determinista de 100 puntos resuelven el 80% a costo cero.`,
 };
 
+function uploadFileDirectWithProgress(
+  putUrl: string,
+  file: File,
+  onProgress: (pct: number) => void
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', putUrl, true);
+    xhr.setRequestHeader('Content-Type', file.type || 'video/mp4');
+    xhr.upload.onprogress = (ev) => {
+      if (ev.lengthComputable && ev.total > 0) {
+        onProgress(Math.min(99, Math.round((ev.loaded / ev.total) * 100)));
+      }
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve();
+      } else {
+        reject(new Error(`Object storage upload failed (${xhr.status})`));
+      }
+    };
+    xhr.onerror = () => reject(new Error('Network/CORS error uploading to object storage.'));
+    xhr.send(file);
+  });
+}
+
 export const UploadModal: React.FC<UploadModalProps> = ({
   isOpen,
   onClose,
   projects,
   geminiConfigured,
+  maxUploadSizeBytes,
+  objectStorageConfigured = false,
   onVideoCreated,
   activeJob,
   lang,
@@ -49,25 +81,34 @@ export const UploadModal: React.FC<UploadModalProps> = ({
   const t = TRANSLATIONS[lang].upload;
   const tc = TRANSLATIONS[lang].common;
 
+  const effectiveMaxBytes =
+    maxUploadSizeBytes && maxUploadSizeBytes > 0 ? maxUploadSizeBytes : 2048 * 1024 * 1024;
+  const maxLimitLabel = formatBytes(effectiveMaxBytes);
+
+  const [sourceMode, setSourceMode] = useState<'file' | 'url'>('file');
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [remoteUrl, setRemoteUrl] = useState('');
   const [title, setTitle] = useState('');
   const [projectId, setProjectId] = useState<number>(projects[0]?.id ?? 1);
   const [mode, setMode] = useState<'heuristic' | 'ai'>('heuristic');
   const [transcriptText, setTranscriptText] = useState('');
   const [srtFilename, setSrtFilename] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [uploadTarget, setUploadTarget] = useState<'chunks' | 'r2'>('chunks');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [youtubeFallback, setYoutubeFallback] = useState(false);
 
   if (!isOpen) return null;
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0] ?? null;
     setSelectedFile(file);
-    if (file && !title) {
+    if (file && !title.trim()) {
       setTitle(file.name.replace(/\.[^.]+$/, ''));
     }
     setError(null);
+    setYoutubeFallback(false);
   };
 
   const loadSrtFile = async (file: File) => {
@@ -92,14 +133,66 @@ export const UploadModal: React.FC<UploadModalProps> = ({
     await loadSrtFile(file);
   };
 
+  const handleSwitchToFileFromYoutube = () => {
+    setSourceMode('file');
+    setError(null);
+    setYoutubeFallback(false);
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setYoutubeFallback(false);
+
+    if (sourceMode === 'url') {
+      const cleanUrl = remoteUrl.trim();
+      if (!/^https?:\/\/.+/i.test(cleanUrl)) {
+        setError(t.errNoUrl);
+        return;
+      }
+      const looksLikeYt = /youtube\.com|youtu\.be/i.test(cleanUrl);
+      if (mode === 'heuristic' && !transcriptText.trim() && !looksLikeYt) {
+        setError(t.errNoTranscript);
+        return;
+      }
+
+      setIsSubmitting(true);
+      setError(null);
+      try {
+        const res = await fetch('/api/videos/from-url', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url: cleanUrl,
+            title: title.trim() || undefined,
+            projectId,
+            useAi: mode === 'ai',
+            transcriptText: transcriptText.trim(),
+          }),
+        });
+        const data = await readJsonResponse<{ video: { id: number }; job: ProcessingJob }>(res);
+        onVideoCreated(data.video.id, data.job);
+      } catch (err) {
+        if (err instanceof ApiError) {
+          if (err.detectedTitle && !title.trim()) {
+            setTitle(err.detectedTitle);
+          }
+          if (err.youtubeBlocked || err.statusCode === 422) {
+            setYoutubeFallback(true);
+          }
+        }
+        setError(err instanceof Error ? err.message : 'Failed to import URL');
+      } finally {
+        setIsSubmitting(false);
+      }
+      return;
+    }
+
     if (!selectedFile) {
       setError(t.errNoFile);
       return;
     }
-    if (selectedFile.size > 250 * 1024 * 1024) {
-      setError(t.errTooLarge);
+    if (selectedFile.size > effectiveMaxBytes) {
+      setError(`${t.errTooLargePrefix} ${maxLimitLabel}.`);
       return;
     }
     if (mode === 'heuristic' && !transcriptText.trim()) {
@@ -113,6 +206,40 @@ export const UploadModal: React.FC<UploadModalProps> = ({
     let uploadId: string | null = null;
 
     try {
+      if (objectStorageConfigured) {
+        setUploadTarget('r2');
+        const presignRes = await fetch('/api/uploads/presign', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            filename: selectedFile.name,
+            mimetype: selectedFile.type || 'video/mp4',
+            sizeBytes: selectedFile.size,
+          }),
+        });
+        const presign = await readJsonResponse<{ key: string; putUrl: string }>(presignRes);
+        await uploadFileDirectWithProgress(presign.putUrl, selectedFile, setUploadProgress);
+
+        const regRes = await fetch('/api/videos/from-storage', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            key: presign.key,
+            originalName: selectedFile.name,
+            sizeBytes: selectedFile.size,
+            title: title.trim() || selectedFile.name,
+            projectId,
+            useAi: mode === 'ai',
+            transcriptText: transcriptText.trim(),
+          }),
+        });
+        const data = await readJsonResponse<{ video: { id: number }; job: ProcessingJob }>(regRes);
+        setUploadProgress(100);
+        onVideoCreated(data.video.id, data.job);
+        return;
+      }
+
+      setUploadTarget('chunks');
       const initRes = await fetch('/api/videos/upload/init', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -168,6 +295,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
   const handleLoadDemo = async () => {
     setIsSubmitting(true);
     setError(null);
+    setYoutubeFallback(false);
     try {
       const res = await fetch('/api/videos/demo', {
         method: 'POST',
@@ -212,7 +340,9 @@ export const UploadModal: React.FC<UploadModalProps> = ({
               <div className="flex items-center justify-between text-sm font-medium text-emerald-700 dark:text-emerald-300">
                 <span className="flex items-center gap-2">
                   <Loader2 className="h-4 w-4 animate-spin" />
-                  <span>{t.uploadingProgress}...</span>
+                  <span>
+                    {uploadTarget === 'r2' ? t.uploadingR2Progress : t.uploadingProgress}...
+                  </span>
                 </span>
                 <span className="font-mono tabular-nums">{uploadProgress}%</span>
               </div>
@@ -283,23 +413,83 @@ export const UploadModal: React.FC<UploadModalProps> = ({
           </div>
 
           <form onSubmit={handleSubmit} className="space-y-4">
-            <label className="flex cursor-pointer flex-col items-center justify-center rounded-lg border border-dashed border-slate-300 bg-slate-50/70 px-6 py-7 text-center transition-colors hover:border-emerald-500/60 dark:border-white/15 dark:bg-white/[0.02]">
-              <Upload className="mb-2 h-7 w-7 text-slate-400" />
-              <span className="text-sm font-medium text-slate-900 dark:text-white">
-                {selectedFile ? selectedFile.name : t.dropzoneEmpty}
-              </span>
-              <span className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                {selectedFile
-                  ? `${(selectedFile.size / (1024 * 1024)).toFixed(1)} ${t.dropzoneReady}`
-                  : t.dropzoneHint}
-              </span>
-              <input
-                type="file"
-                accept="video/*"
-                onChange={handleFileChange}
-                className="sr-only"
-              />
-            </label>
+            <div className="grid grid-cols-2 gap-1 rounded-lg bg-slate-100 p-1 dark:bg-[#181B22]">
+              <button
+                type="button"
+                onClick={() => {
+                  setSourceMode('file');
+                  setError(null);
+                  setYoutubeFallback(false);
+                }}
+                className={`inline-flex items-center justify-center gap-2 rounded-md py-1.5 text-xs font-medium transition-colors ${
+                  sourceMode === 'file'
+                    ? 'bg-white text-slate-900 shadow-sm dark:bg-[#252A36] dark:text-white'
+                    : 'text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white'
+                }`}
+              >
+                <Upload className="h-3.5 w-3.5" />
+                <span>{t.sourceTabFile}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setSourceMode('url');
+                  setError(null);
+                  setYoutubeFallback(false);
+                }}
+                className={`inline-flex items-center justify-center gap-2 rounded-md py-1.5 text-xs font-medium transition-colors ${
+                  sourceMode === 'url'
+                    ? 'bg-white text-slate-900 shadow-sm dark:bg-[#252A36] dark:text-white'
+                    : 'text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white'
+                }`}
+              >
+                <Link2 className="h-3.5 w-3.5" />
+                <span>{t.sourceTabUrl}</span>
+              </button>
+            </div>
+
+            {sourceMode === 'file' ? (
+              <label className="flex cursor-pointer flex-col items-center justify-center rounded-lg border border-dashed border-slate-300 bg-slate-50/70 px-6 py-7 text-center transition-colors hover:border-emerald-500/60 dark:border-white/15 dark:bg-white/[0.02]">
+                <Upload className="mb-2 h-7 w-7 text-slate-400" />
+                <span className="text-sm font-medium text-slate-900 dark:text-white">
+                  {selectedFile ? selectedFile.name : t.dropzoneEmpty}
+                </span>
+                <span className="mt-1 text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                  {selectedFile
+                    ? `${formatBytes(selectedFile.size)} · ${t.dropzoneReadySuffix}`
+                    : `${
+                        objectStorageConfigured ? t.dropzoneHintR2Prefix : t.dropzoneHintPrefix
+                      } ${maxLimitLabel}`}
+                </span>
+                <input
+                  type="file"
+                  accept="video/*,.mkv,.m4v"
+                  onChange={handleFileChange}
+                  className="sr-only"
+                />
+              </label>
+            ) : (
+              <div className="rounded-lg border border-slate-200 bg-slate-50/70 p-4 dark:border-white/10 dark:bg-white/[0.02] space-y-2">
+                <label className="flex items-center gap-1.5 text-xs font-medium text-slate-700 dark:text-slate-300">
+                  <Link2 className="h-3.5 w-3.5 text-emerald-500" />
+                  <span>{t.urlLabel}</span>
+                </label>
+                <input
+                  type="url"
+                  value={remoteUrl}
+                  onChange={(e) => {
+                    setRemoteUrl(e.target.value);
+                    setError(null);
+                    setYoutubeFallback(false);
+                  }}
+                  placeholder={t.urlPlaceholder}
+                  className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 font-mono text-xs text-slate-900 placeholder-slate-400 focus:border-emerald-500 focus:outline-none dark:border-white/10 dark:bg-[#181B22] dark:text-white"
+                />
+                <p className="text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
+                  {t.urlHint}
+                </p>
+              </div>
+            )}
 
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <div>
@@ -435,9 +625,26 @@ export const UploadModal: React.FC<UploadModalProps> = ({
             </div>
 
             {error && (
-              <div className="flex items-start gap-2 rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-600 dark:text-red-300">
-                <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
-                <span>{error}</span>
+              <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-600 dark:text-red-300 space-y-2.5">
+                <div className="flex items-start gap-2">
+                  <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
+                  <span className="leading-relaxed">{error}</span>
+                </div>
+                {youtubeFallback && (
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-t border-red-500/20 pt-2.5">
+                    <span className="text-[11px] text-slate-600 dark:text-slate-300">
+                      {t.ytFallbackHint}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleSwitchToFileFromYoutube}
+                      className="inline-flex items-center gap-1.5 rounded-md bg-emerald-500 px-3 py-1.5 text-xs font-semibold text-slate-950 hover:bg-emerald-400 whitespace-nowrap shrink-0"
+                    >
+                      <Upload className="h-3.5 w-3.5" />
+                      <span>{t.ytSwitchToFile}</span>
+                    </button>
+                  </div>
+                )}
               </div>
             )}
 
@@ -455,7 +662,9 @@ export const UploadModal: React.FC<UploadModalProps> = ({
                 className="inline-flex items-center gap-2 rounded-lg bg-emerald-500 px-5 py-2 text-sm font-semibold text-slate-950 transition-colors hover:bg-emerald-400 disabled:opacity-50"
               >
                 {isSubmitting && <Loader2 className="h-4 w-4 animate-spin" />}
-                <span>{t.startPipeline}</span>
+                <span>
+                  {isSubmitting && sourceMode === 'url' ? t.inspectingUrl : t.startPipeline}
+                </span>
               </button>
             </div>
           </form>

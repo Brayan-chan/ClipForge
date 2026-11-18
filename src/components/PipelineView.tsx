@@ -138,6 +138,13 @@ export const PipelineView: React.FC<PipelineViewProps> = ({
           <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
             {t.storagePrivateNote}
           </p>
+          <div className="mt-3 flex items-center justify-between border-t border-slate-100 pt-2.5 text-[11px] text-slate-500 dark:border-white/5 dark:text-slate-400">
+            <span>{t.uploadLimitLabel}</span>
+            <span className="font-mono font-medium text-slate-800 dark:text-slate-200 tabular-nums">
+              {formatBytes(status?.maxUploadSizeBytes ?? 2048 * 1024 * 1024)} ·{' '}
+              {status?.objectStorageConfigured ? t.uploadModeR2 : t.uploadModeChunks}
+            </span>
+          </div>
           <div className="mt-3">
             <button
               type="button"

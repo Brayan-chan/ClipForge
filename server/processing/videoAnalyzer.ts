@@ -48,7 +48,7 @@ export async function analyzeVideo(filePath: string): Promise<VideoMetadata> {
       '-show_streams',
       filePath,
     ],
-    { timeout: 15000 }
+    { timeout: filePath.startsWith('http') ? 30000 : 15000 }
   );
 
   const parsed = JSON.parse(stdout) as {
@@ -105,8 +105,8 @@ export async function detectSceneChanges(
   videoPath: string,
   durationSeconds: number
 ): Promise<number[]> {
-  if (durationSeconds > 600) {
-    // Skip full-frame decode on very long videos in low-RAM mode
+  if (videoPath.startsWith('http') || durationSeconds > 600) {
+    // Skip full-frame decode on remote streams or very long videos
     return [];
   }
   try {
@@ -164,7 +164,7 @@ export async function generateThumbnail(
         '3',
         outPath,
       ],
-      { timeout: 15000 }
+      { timeout: videoPath.startsWith('http') ? 25000 : 15000 }
     );
     return `/storage/thumbnails/${safeName}`;
   } catch {

@@ -18,6 +18,15 @@ export const THUMBNAILS_DIR = path.join(STORAGE_ROOT, 'thumbnails');
 export const TRANSCRIPTS_DIR = path.join(STORAGE_ROOT, 'transcripts');
 export const DB_FILE = path.join(STORAGE_ROOT, 'clipforge.db.json');
 
+export function resolveVideoInputSource(
+  video: Pick<VideoRecord, 'filename' | 'sourceUrl'>
+): string {
+  if (video.sourceUrl && /^https?:\/\//i.test(video.sourceUrl)) {
+    return video.sourceUrl;
+  }
+  return path.join(UPLOADS_DIR, path.basename(video.filename));
+}
+
 export const DEFAULT_SUBTITLE_STYLE: SubtitleStyle = {
   enabled: true,
   preset: 'hormozi',

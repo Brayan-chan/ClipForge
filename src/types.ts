@@ -41,6 +41,8 @@ export interface VideoRecord {
   fps: number;
   hasAudio: boolean;
   sizeBytes: number;
+  sourceUrl?: string;
+  sourceType?: 'upload' | 'demo' | 'url' | 'youtube';
   status: 'uploaded' | 'processing' | 'ready' | 'error' | 'interrupted';
   errorMessage?: string;
   createdAt: string;
@@ -135,6 +137,8 @@ export interface SystemStatus {
   ffmpegAvailable: boolean;
   ffprobeAvailable: boolean;
   geminiConfigured: boolean;
+  maxUploadSizeBytes?: number;
+  objectStorageConfigured?: boolean;
   storageBytes: number;
   activeQueueTasks: number;
   queuedTasks: number;

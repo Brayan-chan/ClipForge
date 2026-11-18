@@ -18,6 +18,7 @@ import {
   mutateDb,
   readDb,
   recoverInterruptedJobs,
+  resolveVideoInputSource,
 } from './server/db';
 import { runVideoPipeline } from './server/pipeline';
 import { processingQueue } from './server/queue';
@@ -37,9 +38,23 @@ import {
   generateDemoPodcastVideo,
 } from './server/processing/sampleGenerator';
 import {
+  buildReadableObjectUrl,
+  createPresignedObjectUrl,
+  isObjectStorageConfigured,
+} from './server/processing/objectStorage';
+import {
+  UrlIngestionError,
+  ingestYouTubeUrl,
+  probeRemoteDirectUrl,
+} from './server/processing/urlIngestor';
+import {
   MAX_VIDEO_SIZE_BYTES,
+  formatUploadLimitLabel,
   generateSafeMediaFilename,
+  hasEnoughDiskSpace,
+  isYouTubeUrl,
   safeUnlink,
+  validateSafeHttpUrl,
   validateUploadedFileMeta,
 } from './server/processing/validation';
 import {
@@ -121,14 +136,16 @@ interface ChunkUploadSession {
   useAi: boolean;
   transcriptText: string;
   createdAtMs: number;
+  lastActivityMs: number;
+  writeChain: Promise<void>;
 }
 
 const chunkUploadSessions = new Map<string, ChunkUploadSession>();
 
 function cleanupExpiredChunkSessions(): void {
-  const cutoff = Date.now() - 60 * 60 * 1000;
+  const cutoff = Date.now() - 2 * 60 * 60 * 1000; // 2 hours of inactivity
   for (const [id, session] of chunkUploadSessions.entries()) {
-    if (session.createdAtMs < cutoff) {
+    if (session.lastActivityMs < cutoff) {
       safeUnlink(session.tempPath);
       chunkUploadSessions.delete(id);
     }
@@ -227,6 +244,8 @@ app.get('/api/status', async (_req, res) => {
     ffmpegAvailable: binaries.ffmpegAvailable,
     ffprobeAvailable: binaries.ffprobeAvailable,
     geminiConfigured: isGeminiConfigured(),
+    maxUploadSizeBytes: MAX_VIDEO_SIZE_BYTES,
+    objectStorageConfigured: isObjectStorageConfigured(),
     storageBytes: getStorageUsageBytes(),
     activeQueueTasks: queueStats.active,
     queuedTasks: queueStats.queued,
@@ -420,12 +439,24 @@ app.post('/api/videos/upload/init', (req, res) => {
     return;
   }
 
+  const diskCheck = hasEnoughDiskSpace(sizeBytes, STORAGE_ROOT);
+  if (!diskCheck.ok) {
+    res.status(507).json({
+      error: `Insufficient host disk space for this upload (available: ${(
+        diskCheck.availableBytes /
+        (1024 * 1024 * 1024)
+      ).toFixed(1)} GB). Configure S3/R2 object storage or free disk space.`,
+    });
+    return;
+  }
+
   fs.mkdirSync(CHUNKS_DIR, { recursive: true });
   const uploadId = crypto.randomUUID();
   const safeFilename = generateSafeMediaFilename(filename);
   const tempPath = path.join(CHUNKS_DIR, `${uploadId}.part`);
   fs.writeFileSync(tempPath, Buffer.alloc(0));
 
+  const now = Date.now();
   chunkUploadSessions.set(uploadId, {
     uploadId,
     safeFilename,
@@ -439,7 +470,9 @@ app.post('/api/videos/upload/init', (req, res) => {
     projectId: Number(projectId) || 1,
     useAi: useAi === true,
     transcriptText: typeof transcriptText === 'string' ? transcriptText : '',
-    createdAtMs: Date.now(),
+    createdAtMs: now,
+    lastActivityMs: now,
+    writeChain: Promise.resolve(),
   });
 
   res.status(201).json({ uploadId, chunkSizeBytes: UPLOAD_CHUNK_BYTES });
@@ -448,7 +481,7 @@ app.post('/api/videos/upload/init', (req, res) => {
 app.post(
   '/api/videos/upload/chunk/:uploadId',
   express.raw({ type: 'application/octet-stream', limit: '8mb' }),
-  (req, res) => {
+  async (req, res) => {
     const session = chunkUploadSessions.get(req.params.uploadId);
     if (!session) {
       res.status(404).json({ error: 'Upload session not found or expired.' });
@@ -464,13 +497,26 @@ app.post(
     if (session.receivedBytes + chunk.length > MAX_VIDEO_SIZE_BYTES) {
       safeUnlink(session.tempPath);
       chunkUploadSessions.delete(session.uploadId);
-      res.status(400).json({ error: 'Video exceeds maximum 250 MB limit.' });
+      res.status(400).json({
+        error: `Video exceeds maximum ${formatUploadLimitLabel()} limit.`,
+      });
       return;
     }
 
-    fs.appendFileSync(session.tempPath, chunk);
-    session.receivedBytes += chunk.length;
-    res.json({ ok: true, receivedBytes: session.receivedBytes });
+    try {
+      session.writeChain = session.writeChain.then(async () => {
+        await fs.promises.appendFile(session.tempPath, chunk);
+        session.receivedBytes += chunk.length;
+        session.lastActivityMs = Date.now();
+      });
+      await session.writeChain;
+      res.json({ ok: true, receivedBytes: session.receivedBytes });
+    } catch (err) {
+      safeUnlink(session.tempPath);
+      chunkUploadSessions.delete(session.uploadId);
+      const message = err instanceof Error ? err.message : 'Failed to write upload chunk.';
+      res.status(500).json({ error: message });
+    }
   }
 );
 
@@ -482,6 +528,12 @@ app.post('/api/videos/upload/complete/:uploadId', async (req, res) => {
   }
   chunkUploadSessions.delete(session.uploadId);
 
+  try {
+    await session.writeChain;
+  } catch {
+    // checked below
+  }
+
   if (session.receivedBytes === 0 || !fs.existsSync(session.tempPath)) {
     safeUnlink(session.tempPath);
     res.status(400).json({ error: 'No video bytes were uploaded.' });
@@ -491,7 +543,7 @@ app.post('/api/videos/upload/complete/:uploadId', async (req, res) => {
   ensureStorageDirs();
   const finalPath = path.join(UPLOADS_DIR, session.safeFilename);
   try {
-    fs.renameSync(session.tempPath, finalPath);
+    await fs.promises.rename(session.tempPath, finalPath);
     const result = await finalizeUploadedVideo({
       filePath: finalPath,
       filename: session.safeFilename,
@@ -519,6 +571,310 @@ app.delete('/api/videos/upload/:uploadId', (req, res) => {
     chunkUploadSessions.delete(session.uploadId);
   }
   res.json({ ok: true });
+});
+
+app.post('/api/uploads/presign', (req, res) => {
+  if (!isObjectStorageConfigured()) {
+    res.status(501).json({
+      error: 'Direct S3/R2 object storage is not configured on this server.',
+    });
+    return;
+  }
+
+  const { filename, mimetype = 'video/mp4', sizeBytes } = req.body as {
+    filename?: string;
+    mimetype?: string;
+    sizeBytes?: number;
+  };
+
+  if (!filename || typeof sizeBytes !== 'number' || sizeBytes <= 0) {
+    res.status(400).json({ error: 'Invalid upload metadata.' });
+    return;
+  }
+
+  const check = validateUploadedFileMeta({
+    originalname: filename,
+    mimetype,
+    size: sizeBytes,
+  });
+  if (!check.valid) {
+    res.status(400).json({ error: check.error });
+    return;
+  }
+
+  const safeFilename = generateSafeMediaFilename(filename);
+  const key = `uploads/${safeFilename}`;
+  const putUrl = createPresignedObjectUrl({
+    method: 'PUT',
+    key,
+    contentType: mimetype || 'video/mp4',
+    expiresInSeconds: 3600,
+  });
+
+  res.status(201).json({ key, putUrl });
+});
+
+app.post('/api/videos/from-storage', async (req, res) => {
+  if (!isObjectStorageConfigured()) {
+    res.status(501).json({ error: 'Object storage (S3/R2) is not configured.' });
+    return;
+  }
+
+  try {
+    const {
+      key,
+      originalName = 'uploaded-video.mp4',
+      sizeBytes = 0,
+      title,
+      projectId = 1,
+      useAi = false,
+      transcriptText = '',
+    } = req.body as {
+      key?: string;
+      originalName?: string;
+      sizeBytes?: number;
+      title?: string;
+      projectId?: number;
+      useAi?: boolean;
+      transcriptText?: string;
+    };
+
+    if (!key || !key.startsWith('uploads/') || key.includes('..')) {
+      res.status(400).json({ error: 'Invalid object storage key.' });
+      return;
+    }
+
+    const readUrl = buildReadableObjectUrl(key);
+    const probed = await probeRemoteDirectUrl(readUrl);
+    const numericProjectId = Number(projectId) || 1;
+    const aiEnabled = useAi === true;
+    const cleanTranscript = typeof transcriptText === 'string' ? transcriptText.trim() : '';
+    const resolvedName = path.basename(originalName || probed.originalName);
+    const resolvedTitle =
+      (title ?? '').trim().slice(0, 120) ||
+      resolvedName.replace(/\.[^.]+$/, '') ||
+      'Uploaded Video';
+
+    const { video, job } = await mutateDb((db) => {
+      const videoId = db.nextIds.video++;
+      const v = {
+        id: videoId,
+        projectId: numericProjectId,
+        title: resolvedTitle,
+        filename: path.basename(key),
+        originalName: resolvedName,
+        fileUrl: readUrl,
+        sourceUrl: readUrl,
+        sourceType: 'url' as const,
+        thumbnailUrl: null as string | null,
+        duration: probed.meta.duration,
+        width: probed.meta.width,
+        height: probed.meta.height,
+        fps: probed.meta.fps,
+        hasAudio: probed.meta.hasAudio,
+        sizeBytes: Number(sizeBytes) || probed.sizeBytes,
+        status: 'processing' as const,
+        createdAt: new Date().toISOString(),
+      };
+      db.videos.push(v);
+
+      const jobId = db.nextIds.job++;
+      const j = {
+        id: jobId,
+        projectId: numericProjectId,
+        videoId,
+        stage: 'queued' as const,
+        progress: 10,
+        message: 'Object storage video verified & queued (Audio-First + Fast Seek)...',
+        useAi: aiEnabled,
+        updatedAt: new Date().toISOString(),
+      };
+      db.processingJobs.push(j);
+      return { video: v, job: j };
+    });
+
+    const thumbUrl = await generateThumbnail(
+      readUrl,
+      `video-${video.id}-cover.jpg`,
+      Math.min(2, Math.max(0.2, probed.meta.duration * 0.15))
+    );
+    if (thumbUrl) {
+      await mutateDb((db) => {
+        const target = db.videos.find((item) => item.id === video.id);
+        if (target) target.thumbnailUrl = thumbUrl;
+      });
+    }
+
+    void runVideoPipeline({
+      videoId: video.id,
+      jobId: job.id,
+      useAi: aiEnabled,
+      suppliedTranscript: cleanTranscript,
+    });
+
+    res.status(201).json({ video, job });
+  } catch (err) {
+    const statusCode =
+      err instanceof UrlIngestionError
+        ? err.statusCode
+        : (err as { statusCode?: number }).statusCode ?? 500;
+    const message =
+      err instanceof Error ? err.message : 'Failed to register uploaded object storage video';
+    res.status(statusCode).json({ error: message });
+  }
+});
+
+app.post('/api/videos/from-url', async (req, res) => {
+  try {
+    const {
+      url,
+      title,
+      projectId = 1,
+      useAi = false,
+      transcriptText = '',
+    } = req.body as {
+      url?: string;
+      title?: string;
+      projectId?: number;
+      useAi?: boolean;
+      transcriptText?: string;
+    };
+
+    if (!url || !url.trim()) {
+      res.status(400).json({ error: 'Please provide a video URL or YouTube link.' });
+      return;
+    }
+
+    const urlCheck = validateSafeHttpUrl(url);
+    if (!urlCheck.valid || !urlCheck.url) {
+      res.status(400).json({ error: urlCheck.error });
+      return;
+    }
+
+    const cleanUrl = urlCheck.url.toString();
+    const numericProjectId = Number(projectId) || 1;
+    const aiEnabled = useAi === true;
+    const cleanTranscript = typeof transcriptText === 'string' ? transcriptText.trim() : '';
+
+    if (isYouTubeUrl(cleanUrl)) {
+      const yt = await processingQueue.run(() => ingestYouTubeUrl(cleanUrl));
+      const result = await finalizeUploadedVideo({
+        filePath: yt.filePath,
+        filename: yt.filename,
+        originalName: yt.originalName,
+        sizeBytes: yt.sizeBytes,
+        title: (title ?? '').trim().slice(0, 120) || yt.title,
+        projectId: numericProjectId,
+        useAi: aiEnabled,
+        transcriptText: cleanTranscript,
+      });
+
+      // If YouTube provided native captions and user didn't override, persist them immediately
+      if (!cleanTranscript && yt.segments.length > 0) {
+        await mutateDb((db) => {
+          db.transcriptions = db.transcriptions.filter((t) => t.videoId !== result.video.id);
+          db.transcriptions.push({
+            id: db.nextIds.transcription++,
+            videoId: result.video.id,
+            source: 'srt',
+            language: 'auto',
+            segments: yt.segments,
+            createdAt: new Date().toISOString(),
+          });
+          const v = db.videos.find((item) => item.id === result.video.id);
+          if (v) v.sourceType = 'youtube';
+        });
+      } else {
+        await mutateDb((db) => {
+          const v = db.videos.find((item) => item.id === result.video.id);
+          if (v) v.sourceType = 'youtube';
+        });
+      }
+
+      res.status(201).json(result);
+      return;
+    }
+
+    // Direct remote video URL (MP4 / WebM / MOV / R2 / S3): Audio-First + HTTP Range Fast-Seek
+    const probed = await probeRemoteDirectUrl(cleanUrl);
+    const resolvedTitle =
+      (title ?? '').trim().slice(0, 120) ||
+      probed.originalName.replace(/\.[^.]+$/, '') ||
+      'Remote Video';
+
+    const { video, job } = await mutateDb((db) => {
+      const videoId = db.nextIds.video++;
+      const v = {
+        id: videoId,
+        projectId: numericProjectId,
+        title: resolvedTitle,
+        filename: probed.originalName,
+        originalName: probed.originalName,
+        fileUrl: cleanUrl,
+        sourceUrl: cleanUrl,
+        sourceType: 'url' as const,
+        thumbnailUrl: null as string | null,
+        duration: probed.meta.duration,
+        width: probed.meta.width,
+        height: probed.meta.height,
+        fps: probed.meta.fps,
+        hasAudio: probed.meta.hasAudio,
+        sizeBytes: probed.sizeBytes,
+        status: 'processing' as const,
+        createdAt: new Date().toISOString(),
+      };
+      db.videos.push(v);
+
+      const jobId = db.nextIds.job++;
+      const j = {
+        id: jobId,
+        projectId: numericProjectId,
+        videoId,
+        stage: 'queued' as const,
+        progress: 10,
+        message: 'Remote video stream verified & queued (Audio-First + Fast Seek)...',
+        useAi: aiEnabled,
+        updatedAt: new Date().toISOString(),
+      };
+      db.processingJobs.push(j);
+      return { video: v, job: j };
+    });
+
+    const thumbUrl = await generateThumbnail(
+      cleanUrl,
+      `video-${video.id}-cover.jpg`,
+      Math.min(2, Math.max(0.2, probed.meta.duration * 0.15))
+    );
+    if (thumbUrl) {
+      await mutateDb((db) => {
+        const target = db.videos.find((item) => item.id === video.id);
+        if (target) target.thumbnailUrl = thumbUrl;
+      });
+    }
+
+    void runVideoPipeline({
+      videoId: video.id,
+      jobId: job.id,
+      useAi: aiEnabled,
+      suppliedTranscript: cleanTranscript,
+    });
+
+    res.status(201).json({ video, job });
+  } catch (err) {
+    const statusCode =
+      err instanceof UrlIngestionError
+        ? err.statusCode
+        : (err as { statusCode?: number }).statusCode ?? 500;
+    const message = err instanceof Error ? err.message : 'Failed to import video from URL';
+    const extra =
+      err instanceof UrlIngestionError
+        ? {
+            detectedTitle: err.detectedTitle,
+            youtubeBlocked: err.youtubeBlocked,
+          }
+        : {};
+    res.status(statusCode).json({ error: message, ...extra });
+  }
 });
 
 app.post('/api/videos/:id/retry', async (req, res) => {
@@ -622,7 +978,9 @@ app.delete('/api/videos/:id', async (req, res) => {
     return;
   }
 
-  safeUnlink(path.join(UPLOADS_DIR, path.basename(video.filename)));
+  if (!video.sourceUrl) {
+    safeUnlink(path.join(UPLOADS_DIR, path.basename(video.filename)));
+  }
 
   await mutateDb((state) => {
     state.videos = state.videos.filter((v) => v.id !== videoId);
@@ -732,7 +1090,7 @@ app.post('/api/clips', async (req, res) => {
   );
 
   const nextId = db.nextIds.clip;
-  const videoPath = path.join(UPLOADS_DIR, path.basename(video.filename));
+  const videoPath = resolveVideoInputSource(video);
   const thumbUrl = await generateThumbnail(
     videoPath,
     `clip-${nextId}-preview.jpg`,
@@ -899,7 +1257,7 @@ app.post('/api/clips/:id/compile', async (req, res) => {
       return;
     }
     const trans = db.transcriptions.find((t) => t.videoId === clip.videoId);
-    const videoPath = path.join(UPLOADS_DIR, path.basename(video.filename));
+    const videoPath = resolveVideoInputSource(video);
 
     // Serialize heavy FFmpeg rendering through the single-worker queue
     const rendered = await processingQueue.run(() =>

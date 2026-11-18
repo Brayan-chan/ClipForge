@@ -370,6 +370,8 @@ export function App() {
         onClose={() => setUploadModalOpen(false)}
         projects={projects}
         geminiConfigured={systemStatus?.geminiConfigured ?? false}
+        maxUploadSizeBytes={systemStatus?.maxUploadSizeBytes}
+        objectStorageConfigured={systemStatus?.objectStorageConfigured ?? false}
         onVideoCreated={handleVideoCreated}
         activeJob={trackedJob}
         lang={lang}
