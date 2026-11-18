@@ -13,6 +13,7 @@ import {
   Sparkles,
   Subtitles,
   Trash2,
+  Upload,
   Volume2,
   VolumeX,
   X,
@@ -47,6 +48,7 @@ interface ClipStudioProps {
   onCreateClip: (videoId: number, startTime: number, endTime: number) => Promise<ClipRecord>;
   onDeleteClip: (clipId: number) => Promise<void>;
   onSaveTranscript: (videoId: number, segments: TranscriptSegment[]) => Promise<void>;
+  onImportSrt: (videoId: number, file: File) => Promise<{ importedCount: number }>;
   onOpenUpload: () => void;
   lang: Language;
   onChangeLang: (lang: Language) => void;
@@ -68,6 +70,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
   onCreateClip,
   onDeleteClip,
   onSaveTranscript,
+  onImportSrt,
   onOpenUpload,
   lang,
   onChangeLang,
@@ -331,6 +334,28 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
       setFeedback({
         type: 'err',
         text: err instanceof Error ? err.message : 'Failed to save transcript',
+      });
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleImportSrtFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file || !activeVideo) return;
+    setIsSaving(true);
+    setFeedback(null);
+    try {
+      const result = await onImportSrt(activeVideo.id, file);
+      setFeedback({
+        type: 'ok',
+        text: `${t.msgSrtImported}: ${result.importedCount} (${file.name})`,
+      });
+    } catch (err) {
+      setFeedback({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Failed to import SRT file',
       });
     } finally {
       setIsSaving(false);
@@ -1278,18 +1303,31 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
 
             {inspectorTab === 'transcript' && (
               <div className="space-y-3">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">
                     {t.syncedSegments} ({segmentsDraft.length})
                   </span>
-                  <button
-                    type="button"
-                    disabled={isSaving || segmentsDraft.length === 0}
-                    onClick={handleSaveTranscriptSegments}
-                    className="rounded-md bg-emerald-500 px-2.5 py-1 text-xs font-semibold text-slate-950 hover:bg-emerald-400 disabled:opacity-50"
-                  >
-                    {t.saveText}
-                  </button>
+                  <div className="flex items-center gap-1.5">
+                    <label className="inline-flex cursor-pointer items-center gap-1 rounded-md border border-slate-200 px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-white/10 dark:text-slate-200 dark:hover:bg-white/5">
+                      <Upload className="h-3 w-3" />
+                      <span>{t.importSrt}</span>
+                      <input
+                        type="file"
+                        accept=".srt"
+                        disabled={isSaving}
+                        onChange={handleImportSrtFile}
+                        className="sr-only"
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      disabled={isSaving || segmentsDraft.length === 0}
+                      onClick={handleSaveTranscriptSegments}
+                      className="rounded-md bg-emerald-500 px-2.5 py-1 text-xs font-semibold text-slate-950 hover:bg-emerald-400 disabled:opacity-50"
+                    >
+                      {t.saveText}
+                    </button>
+                  </div>
                 </div>
 
                 {segmentsDraft.length === 0 ? (

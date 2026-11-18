@@ -38,7 +38,7 @@
     {
       "id": 3,
       "videoId": 1,
-      "source": "sample",
+      "source": "srt",
       "language": "auto",
       "segments": [
         {

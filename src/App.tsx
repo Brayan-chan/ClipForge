@@ -249,6 +249,24 @@ export function App() {
     await fetchWorkspace();
   };
 
+  const handleImportSrt = async (
+    videoId: number,
+    file: File
+  ): Promise<{ importedCount: number }> => {
+    const form = new FormData();
+    form.append('srt', file);
+    const res = await fetch(`/api/transcriptions/${videoId}/import-srt`, {
+      method: 'POST',
+      body: form,
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to import SRT file');
+    }
+    await fetchWorkspace();
+    return { importedCount: data.importedCount ?? data.transcription?.segments?.length ?? 0 };
+  };
+
   const handleCreateProject = async (name: string) => {
     await fetch('/api/projects', {
       method: 'POST',
@@ -328,6 +346,7 @@ export function App() {
           onCreateClip={handleCreateClip}
           onDeleteClip={handleDeleteClip}
           onSaveTranscript={handleSaveTranscript}
+          onImportSrt={handleImportSrt}
           onOpenUpload={() => {
             setTrackedJobId(null);
             setUploadModalOpen(true);

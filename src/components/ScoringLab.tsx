@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { CheckCircle2, Play, RotateCcw, Save } from 'lucide-react';
+import { CheckCircle2, Play, RotateCcw, Save, Upload } from 'lucide-react';
 import { TRANSLATIONS, type Language } from '../i18n';
 import type { ClipScoreBreakdown, ContextStatus, ScoringConfig, TranscriptSegment } from '../types';
 import { formatTimecode } from '../utils/format';
@@ -96,6 +96,16 @@ export const ScoringLab: React.FC<ScoringLabProps> = ({
       setResults(data.candidates ?? []);
     } finally {
       setIsTesting(false);
+    }
+  };
+
+  const handleImportSrt = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    const text = (await file.text()).replace(/^\uFEFF/, '').trim();
+    if (text) {
+      setTestText(text);
     }
   };
 
@@ -223,19 +233,31 @@ export const ScoringLab: React.FC<ScoringLabProps> = ({
         </section>
 
         <section className="lg:col-span-7 rounded-xl border border-slate-200 bg-white p-6 dark:border-white/10 dark:bg-[#111318] space-y-4">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <h2 className="font-display text-base font-semibold text-slate-900 dark:text-white">
               {t.testerTitle}
             </h2>
-            <button
-              type="button"
-              disabled={isTesting}
-              onClick={handleTest}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3.5 py-1.5 text-xs font-semibold text-slate-950 hover:bg-emerald-400 disabled:opacity-50"
-            >
-              <Play className="h-3.5 w-3.5" />
-              <span>{t.runScorer}</span>
-            </button>
+            <div className="flex items-center gap-2">
+              <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-white/10 dark:text-slate-200 dark:hover:bg-white/5">
+                <Upload className="h-3.5 w-3.5" />
+                <span>{t.importSrt}</span>
+                <input
+                  type="file"
+                  accept=".srt"
+                  onChange={handleImportSrt}
+                  className="sr-only"
+                />
+              </label>
+              <button
+                type="button"
+                disabled={isTesting}
+                onClick={handleTest}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3.5 py-1.5 text-xs font-semibold text-slate-950 hover:bg-emerald-400 disabled:opacity-50"
+              >
+                <Play className="h-3.5 w-3.5" />
+                <span>{t.runScorer}</span>
+              </button>
+            </div>
           </div>
 
           <textarea

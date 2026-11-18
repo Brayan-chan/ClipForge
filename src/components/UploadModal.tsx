@@ -53,6 +53,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
   const [projectId, setProjectId] = useState<number>(projects[0]?.id ?? 1);
   const [mode, setMode] = useState<'heuristic' | 'ai'>('heuristic');
   const [transcriptText, setTranscriptText] = useState('');
+  const [srtFilename, setSrtFilename] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -65,6 +66,28 @@ export const UploadModal: React.FC<UploadModalProps> = ({
       setTitle(file.name.replace(/\.[^.]+$/, ''));
     }
     setError(null);
+  };
+
+  const loadSrtFile = async (file: File) => {
+    if (!file.name.toLowerCase().endsWith('.srt') || file.size > 2 * 1024 * 1024) {
+      setError(t.errInvalidSrt);
+      return;
+    }
+    const text = (await file.text()).replace(/^\uFEFF/, '');
+    if (!text.includes('-->')) {
+      setError(t.errInvalidSrt);
+      return;
+    }
+    setTranscriptText(text.trim());
+    setSrtFilename(file.name);
+    setError(null);
+  };
+
+  const handleSrtFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    await loadSrtFile(file);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -307,23 +330,54 @@ export const UploadModal: React.FC<UploadModalProps> = ({
             </div>
 
             <div>
-              <div className="mb-1.5 flex items-center justify-between">
+              <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
                 <label className="flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
                   <FileText className="h-3.5 w-3.5" />
                   <span>{mode === 'heuristic' ? t.transcriptRequired : t.transcriptOptional}</span>
+                  {srtFilename && (
+                    <span className="font-mono text-[11px] text-emerald-600 dark:text-emerald-400">
+                      · {t.srtLoaded}: {srtFilename}
+                    </span>
+                  )}
                 </label>
-                <button
-                  type="button"
-                  onClick={() => setTranscriptText(SAMPLE_SRT_BY_LANG[lang])}
-                  className="text-xs font-medium text-emerald-600 hover:underline dark:text-emerald-400"
-                >
-                  {t.insertExample}
-                </button>
+                <div className="flex items-center gap-3">
+                  <label className="inline-flex cursor-pointer items-center gap-1 text-xs font-medium text-emerald-600 hover:underline dark:text-emerald-400">
+                    <Upload className="h-3 w-3" />
+                    <span>{t.importSrt}</span>
+                    <input
+                      type="file"
+                      accept=".srt"
+                      onChange={handleSrtFileChange}
+                      className="sr-only"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setTranscriptText(SAMPLE_SRT_BY_LANG[lang]);
+                      setSrtFilename(null);
+                    }}
+                    className="text-xs font-medium text-slate-500 hover:text-slate-900 hover:underline dark:text-slate-400 dark:hover:text-white"
+                  >
+                    {t.insertExample}
+                  </button>
+                </div>
               </div>
               <textarea
                 rows={4}
                 value={transcriptText}
-                onChange={(e) => setTranscriptText(e.target.value)}
+                onChange={(e) => {
+                  setTranscriptText(e.target.value);
+                  if (srtFilename) setSrtFilename(null);
+                }}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={async (e) => {
+                  const file = e.dataTransfer.files?.[0];
+                  if (file && file.name.toLowerCase().endsWith('.srt')) {
+                    e.preventDefault();
+                    await loadSrtFile(file);
+                  }
+                }}
                 placeholder={t.transcriptPlaceholder}
                 className="w-full rounded-lg border border-slate-200 bg-white p-3 font-mono text-xs text-slate-900 placeholder-slate-400 focus:border-emerald-500 focus:outline-none dark:border-white/10 dark:bg-[#181B22] dark:text-slate-100"
               />

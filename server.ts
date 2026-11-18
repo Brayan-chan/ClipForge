@@ -21,6 +21,7 @@ import { runVideoPipeline } from './server/pipeline';
 import { processingQueue } from './server/queue';
 import {
   detectCandidateClipsHeuristic,
+  parseSrtFileContent,
   parseSrtOrTextTranscript,
   scoreWindow,
 } from './server/processing/clipScorer';
@@ -84,6 +85,19 @@ const upload = multer({
     });
     if (!check.valid) {
       cb(new Error(check.error));
+      return;
+    }
+    cb(null, true);
+  },
+});
+
+const srtUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (ext !== '.srt') {
+      cb(new Error('Only .srt subtitle files are allowed.'));
       return;
     }
     cb(null, true);
@@ -449,6 +463,56 @@ app.patch('/api/transcriptions/:videoId', async (req, res) => {
     return;
   }
   res.json(updated);
+});
+
+app.post('/api/transcriptions/:videoId/import-srt', srtUpload.single('srt'), async (req, res) => {
+  const videoId = Number(req.params.videoId);
+  const db = readDb();
+  const video = db.videos.find((v) => v.id === videoId);
+  if (!video) {
+    res.status(404).json({ error: 'Video not found' });
+    return;
+  }
+
+  const rawSrt = req.file
+    ? req.file.buffer.toString('utf-8')
+    : typeof req.body?.srtText === 'string'
+    ? req.body.srtText
+    : '';
+
+  if (!rawSrt.trim()) {
+    res.status(400).json({ error: 'Please attach an .srt file or provide srtText.' });
+    return;
+  }
+
+  const segments = parseSrtFileContent(rawSrt);
+  if (segments.length === 0) {
+    res.status(400).json({
+      error: 'No valid SRT cue blocks found (expected format: 00:00:01,000 --> 00:00:04,000).',
+    });
+    return;
+  }
+
+  const transcription = await mutateDb((state) => {
+    const existing = state.transcriptions.find((t) => t.videoId === videoId);
+    if (existing) {
+      existing.segments = segments;
+      existing.source = 'srt';
+      return existing;
+    }
+    const created = {
+      id: state.nextIds.transcription++,
+      videoId,
+      source: 'srt' as const,
+      language: 'auto',
+      segments,
+      createdAt: new Date().toISOString(),
+    };
+    state.transcriptions.push(created);
+    return created;
+  });
+
+  res.json({ transcription, importedCount: segments.length });
 });
 
 app.post('/api/clips', async (req, res) => {

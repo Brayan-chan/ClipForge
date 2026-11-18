@@ -78,46 +78,96 @@ const DANGLING_STARTS =
 const DANGLING_PRONOUNS =
   /^(esto |eso |aquello |él |ella |ellos |it |that |this |they |he |she )\b/i;
 
+const SRT_TIME_REGEX =
+  /(\d{1,2}:)?(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{1,2}:)?(\d{2}):(\d{2})[,.](\d{3})/;
+
+function parseSrtTimestampMatch(match: RegExpMatchArray): { start: number; end: number } {
+  const startH = match[1] ? parseInt(match[1], 10) : 0;
+  const startM = parseInt(match[2], 10);
+  const startS = parseInt(match[3], 10);
+  const startMs = parseInt(match[4], 10);
+  const endH = match[5] ? parseInt(match[5], 10) : 0;
+  const endM = parseInt(match[6], 10);
+  const endS = parseInt(match[7], 10);
+  const endMs = parseInt(match[8], 10);
+  const start = startH * 3600 + startM * 60 + startS + startMs / 1000;
+  const end = endH * 3600 + endM * 60 + endS + endMs / 1000;
+  return {
+    start: Math.round(start * 100) / 100,
+    end: Math.round(Math.max(start + 0.5, end) * 100) / 100,
+  };
+}
+
+export function parseSrtFileContent(rawText: string): TranscriptSegment[] {
+  const cleaned = rawText.replace(/^\uFEFF/, '').trim();
+  if (!cleaned) return [];
+
+  const lines = cleaned.split(/\r?\n/);
+  const parsed: TranscriptSegment[] = [];
+
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i].trim();
+    const match = line.match(SRT_TIME_REGEX);
+    if (!match) {
+      i++;
+      continue;
+    }
+
+    const { start, end } = parseSrtTimestampMatch(match);
+    const textLines: string[] = [];
+    let j = i + 1;
+
+    while (j < lines.length) {
+      const nextLine = lines[j].trim();
+      if (!nextLine) {
+        j++;
+        break;
+      }
+      if (SRT_TIME_REGEX.test(nextLine)) {
+        break;
+      }
+      // If a purely numeric cue index immediately precedes a timestamp line, stop before it
+      if (
+        /^\d+$/.test(nextLine) &&
+        j + 1 < lines.length &&
+        SRT_TIME_REGEX.test(lines[j + 1].trim())
+      ) {
+        break;
+      }
+      textLines.push(nextLine);
+      j++;
+    }
+
+    const text = textLines
+      .join(' ')
+      .replace(/<[^>]+>/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (text) {
+      parsed.push({
+        id: `seg-${parsed.length + 1}`,
+        start,
+        end,
+        text,
+      });
+    }
+
+    i = j;
+  }
+
+  return parsed;
+}
+
 export function parseSrtOrTextTranscript(
   rawText: string,
   videoDuration: number
 ): TranscriptSegment[] {
-  const trimmed = rawText.trim();
+  const trimmed = rawText.replace(/^\uFEFF/, '').trim();
   if (!trimmed) return [];
 
-  const srtBlocks = trimmed.split(/\r?\n\r?\n+/);
-  const parsedSrt: TranscriptSegment[] = [];
-  const timeRegex =
-    /(\d{1,2}:)?(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{1,2}:)?(\d{2}):(\d{2})[,.](\d{3})/;
-
-  for (const block of srtBlocks) {
-    const lines = block.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-    const timeLineIdx = lines.findIndex((l) => timeRegex.test(l));
-    if (timeLineIdx !== -1) {
-      const match = lines[timeLineIdx].match(timeRegex);
-      if (match) {
-        const startH = match[1] ? parseInt(match[1], 10) : 0;
-        const startM = parseInt(match[2], 10);
-        const startS = parseInt(match[3], 10);
-        const startMs = parseInt(match[4], 10);
-        const endH = match[5] ? parseInt(match[5], 10) : 0;
-        const endM = parseInt(match[6], 10);
-        const endS = parseInt(match[7], 10);
-        const endMs = parseInt(match[8], 10);
-        const start = startH * 3600 + startM * 60 + startS + startMs / 1000;
-        const end = endH * 3600 + endM * 60 + endS + endMs / 1000;
-        const text = lines.slice(timeLineIdx + 1).join(' ').replace(/<[^>]+>/g, '').trim();
-        if (text) {
-          parsedSrt.push({
-            id: `seg-${parsedSrt.length + 1}`,
-            start: Math.round(start * 100) / 100,
-            end: Math.round(Math.max(start + 1, end) * 100) / 100,
-            text,
-          });
-        }
-      }
-    }
-  }
+  const parsedSrt = parseSrtFileContent(trimmed);
   if (parsedSrt.length > 0) return parsedSrt;
 
   const lineSegments: TranscriptSegment[] = [];
