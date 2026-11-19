@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   AlertCircle,
   CheckCircle2,
@@ -27,7 +27,7 @@ interface ProjectsDashboardProps {
   onOpenUpload: () => void;
   onGenerateDemo: () => Promise<void>;
   onOpenStudio: (videoId: number, clipId?: number) => void;
-  onDeleteVideo: (videoId: number) => Promise<void>;
+  onDeleteVideo: (videoId: number) => Promise<{ removedArtifacts: number; removedBytes: number }>;
   onRetryVideo: (videoId: number) => Promise<void>;
   onCompileClip: (clipId: number) => Promise<void>;
   onCreateProject: (name: string) => Promise<void>;
@@ -62,6 +62,34 @@ export const ProjectsDashboard: React.FC<ProjectsDashboardProps> = ({
   const [compilingClipId, setCompilingClipId] = useState<number | null>(null);
   const [newProjectName, setNewProjectName] = useState('');
   const [showNewProject, setShowNewProject] = useState(false);
+  const [deleteVideoId, setDeleteVideoId] = useState<number | null>(null);
+  const [deletingVideo, setDeletingVideo] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
+
+  const deleteVideo = videos.find((video) => video.id === deleteVideoId) ?? null;
+  const deleteClipCount = deleteVideoId === null
+    ? 0
+    : clips.filter((clip) => clip.videoId === deleteVideoId).length;
+
+  useEffect(() => {
+    if (!toast) return;
+    const timeout = window.setTimeout(() => setToast(null), 4000);
+    return () => window.clearTimeout(timeout);
+  }, [toast]);
+
+  const confirmDeleteVideo = async () => {
+    if (!deleteVideo) return;
+    setDeletingVideo(true);
+    try {
+      const result = await onDeleteVideo(deleteVideo.id);
+      setDeleteVideoId(null);
+      setToast(`${t.deleteVideoSuccess} · ${formatBytes(result.removedBytes)}`);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : 'Unable to delete video');
+    } finally {
+      setDeletingVideo(false);
+    }
+  };
 
   const filteredVideos = useMemo(() => {
     return videos.filter((v) => {
@@ -443,7 +471,7 @@ export const ProjectsDashboard: React.FC<ProjectsDashboardProps> = ({
 
                     <button
                       type="button"
-                      onClick={() => onDeleteVideo(video.id)}
+                      onClick={() => setDeleteVideoId(video.id)}
                       className="rounded-lg p-1.5 text-slate-400 hover:bg-red-500/10 hover:text-red-500"
                       aria-label={`${tc.delete} ${video.title}`}
                     >
@@ -455,6 +483,44 @@ export const ProjectsDashboard: React.FC<ProjectsDashboardProps> = ({
             );
           })}
         </section>
+      )}
+
+      {deleteVideo && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
+          <div role="alertdialog" aria-modal="true" className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl dark:border-white/10 dark:bg-[#111318]">
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-red-500/10 text-red-500">
+                <Trash2 className="h-5 w-5" />
+              </div>
+              <button type="button" disabled={deletingVideo} onClick={() => setDeleteVideoId(null)} className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 dark:hover:bg-white/5" aria-label={tc.close}>
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+            <h2 className="mt-4 font-display text-xl font-semibold text-slate-900 dark:text-white">{t.deleteVideoTitle}</h2>
+            <p className="mt-2 text-sm text-slate-600 dark:text-slate-400">{t.deleteVideoWarning}</p>
+            <div className="mt-4 rounded-xl border border-red-500/15 bg-red-500/5 p-4 text-sm text-slate-700 dark:text-slate-300">
+              <div className="font-semibold text-slate-900 dark:text-white line-clamp-1">{deleteVideo.title}</div>
+              <ul className="mt-3 space-y-2 text-xs">
+                <li>• {t.deleteSourceItem}</li>
+                <li>• {t.deleteClipsItem} ({deleteClipCount})</li>
+                <li>• {t.deleteThumbnailsItem}</li>
+              </ul>
+            </div>
+            <div className="mt-6 flex justify-end gap-2">
+              <button type="button" disabled={deletingVideo} onClick={() => setDeleteVideoId(null)} className="rounded-lg border border-slate-200 px-4 py-2 text-sm font-medium dark:border-white/10">{tc.cancel}</button>
+              <button type="button" disabled={deletingVideo} onClick={confirmDeleteVideo} className="inline-flex items-center gap-2 rounded-lg bg-red-500 px-4 py-2 text-sm font-semibold text-white hover:bg-red-600 disabled:opacity-60">
+                {deletingVideo ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                {t.deleteVideoConfirm}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {toast && (
+        <div role="status" className="fixed bottom-5 right-5 z-[80] max-w-sm rounded-xl border border-white/10 bg-slate-950 px-4 py-3 text-sm font-medium text-white shadow-2xl">
+          {toast}
+        </div>
       )}
 
       {/* Video Details & Generated Clips Modal */}

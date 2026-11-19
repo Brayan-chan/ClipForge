@@ -114,6 +114,89 @@ function reconcileOrphanedClipArtifacts(): number {
   return removeClipArtifactsByIds(orphanIds);
 }
 
+interface CleanupReport {
+  removedFiles: number;
+  removedBytes: number;
+}
+
+function removeFileWithReport(filePath: string, report: CleanupReport): void {
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) return;
+    fs.unlinkSync(filePath);
+    report.removedFiles++;
+    report.removedBytes += stat.size;
+  } catch {
+    // A cache file can disappear between the scan and deletion.
+  }
+}
+
+function localBasename(url: string | null | undefined, prefix: string): string | null {
+  if (!url?.startsWith(prefix)) return null;
+  return path.basename(url);
+}
+
+/** Reconciles managed media folders against the database without touching live assets. */
+function purgeUnreferencedStorage(): CleanupReport {
+  const db = readDb();
+  const report: CleanupReport = { removedFiles: 0, removedBytes: 0 };
+  const referencedUploads = new Set(
+    db.videos.filter((video) => !video.sourceUrl).map((video) => path.basename(video.filename))
+  );
+  const referencedClips = new Set<string>();
+  const referencedThumbnails = new Set<string>();
+
+  for (const video of db.videos) {
+    const thumbnail = localBasename(video.thumbnailUrl, '/storage/thumbnails/');
+    if (thumbnail) referencedThumbnails.add(thumbnail);
+  }
+  for (const clip of db.clips) {
+    for (const url of [clip.exportedUrl, clip.srtUrl]) {
+      const filename = localBasename(url, '/storage/clips/');
+      if (filename) referencedClips.add(filename);
+    }
+    const thumbnail = localBasename(clip.thumbnailUrl, '/storage/thumbnails/');
+    if (thumbnail) referencedThumbnails.add(thumbnail);
+    for (const variant of Object.values(clip.exportVariants ?? {})) {
+      for (const url of [variant?.exportedUrl, variant?.srtUrl]) {
+        const filename = localBasename(url, '/storage/clips/');
+        if (filename) referencedClips.add(filename);
+      }
+      const variantThumbnail = localBasename(variant?.thumbnailUrl, '/storage/thumbnails/');
+      if (variantThumbnail) referencedThumbnails.add(variantThumbnail);
+    }
+  }
+
+  const removeUnreferenced = (dir: string, keep: Set<string>) => {
+    if (!fs.existsSync(dir)) return;
+    for (const filename of fs.readdirSync(dir)) {
+      if (!keep.has(filename)) removeFileWithReport(path.join(dir, filename), report);
+    }
+  };
+  removeUnreferenced(UPLOADS_DIR, referencedUploads);
+  removeUnreferenced(CLIPS_DIR, referencedClips);
+  removeUnreferenced(THUMBNAILS_DIR, referencedThumbnails);
+
+  // Reproducible intermediate files, never canonical user data.
+  for (const dir of [TRANSCRIPTS_DIR, PREVIEWS_DIR]) {
+    if (!fs.existsSync(dir)) continue;
+    for (const filename of fs.readdirSync(dir)) {
+      removeFileWithReport(path.join(dir, filename), report);
+    }
+  }
+  if (fs.existsSync(CHUNKS_DIR)) {
+    const activeChunkFiles = new Set(
+      [...chunkUploadSessions.values()].map((session) => path.basename(session.tempPath))
+    );
+    for (const filename of fs.readdirSync(CHUNKS_DIR)) {
+      if (!activeChunkFiles.has(filename)) {
+        removeFileWithReport(path.join(CHUNKS_DIR, filename), report);
+      }
+    }
+  }
+  return report;
+}
+
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => {
     ensureStorageDirs();
@@ -1147,6 +1230,7 @@ app.get('/api/videos/:id/preview', async (req, res) => {
 
 app.delete('/api/videos/:id', async (req, res) => {
   const videoId = Number(req.params.id);
+  const storageBefore = getStorageUsageBytes();
   const db = readDb();
   const video = db.videos.find((v) => v.id === videoId);
   if (!video) {
@@ -1196,7 +1280,11 @@ app.delete('/api/videos/:id', async (req, res) => {
     }
   }
 
-  res.json({ ok: true, removedArtifacts });
+  res.json({
+    ok: true,
+    removedArtifacts,
+    removedBytes: Math.max(0, storageBefore - getStorageUsageBytes()),
+  });
 });
 
 app.patch('/api/transcriptions/:videoId', async (req, res) => {
@@ -1583,17 +1671,21 @@ app.post('/api/scoring-lab/test', (req, res) => {
 });
 
 app.post('/api/storage/cleanup', (_req, res) => {
-  let removed = 0;
-  for (const dir of [TRANSCRIPTS_DIR, PREVIEWS_DIR]) {
-    if (fs.existsSync(dir)) {
-      for (const file of fs.readdirSync(dir)) {
-        safeUnlink(path.join(dir, file));
-        removed++;
-      }
-    }
+  const queue = processingQueue.getStats();
+  if (queue.active > 0 || queue.queued > 0) {
+    res.status(409).json({
+      error: 'Storage cannot be purged while videos or clips are being processed.',
+    });
+    return;
   }
-  removed += reconcileOrphanedClipArtifacts();
-  res.json({ ok: true, removed, storageBytes: getStorageUsageBytes() });
+  const report = purgeUnreferencedStorage();
+  res.json({
+    ok: true,
+    removed: report.removedFiles,
+    removedFiles: report.removedFiles,
+    removedBytes: report.removedBytes,
+    storageBytes: getStorageUsageBytes(),
+  });
 });
 
 // Express error handler for multer / upload validation errors

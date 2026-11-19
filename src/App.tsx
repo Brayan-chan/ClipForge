@@ -163,12 +163,14 @@ export function App() {
   };
 
   const handleDeleteVideo = async (videoId: number) => {
-    await fetch(`/api/videos/${videoId}`, { method: 'DELETE' });
+    const res = await fetch(`/api/videos/${videoId}`, { method: 'DELETE' });
+    const result = await readJsonResponse<{ removedArtifacts: number; removedBytes: number }>(res);
     if (selectedVideoId === videoId) {
       setSelectedVideoId(null);
       setSelectedClipId(null);
     }
     await fetchWorkspace();
+    return result;
   };
 
   const handleRetryVideo = async (videoId: number) => {
@@ -286,8 +288,14 @@ export function App() {
   };
 
   const handleCleanupStorage = async () => {
-    await fetch('/api/storage/cleanup', { method: 'POST' });
+    const res = await fetch('/api/storage/cleanup', { method: 'POST' });
+    const result = await readJsonResponse<{
+      removedFiles: number;
+      removedBytes: number;
+      storageBytes: number;
+    }>(res);
     await fetchWorkspace();
+    return result;
   };
 
   return (

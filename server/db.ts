@@ -204,7 +204,13 @@ export function recoverInterruptedJobs(): number {
 export function getStorageUsageBytes(): number {
   ensureStorageDirs();
   let total = 0;
-  const dirs = [UPLOADS_DIR, CLIPS_DIR, THUMBNAILS_DIR, TRANSCRIPTS_DIR];
+  const dirs = [
+    UPLOADS_DIR,
+    CLIPS_DIR,
+    THUMBNAILS_DIR,
+    TRANSCRIPTS_DIR,
+    path.join(STORAGE_ROOT, 'previews'),
+  ];
   for (const dir of dirs) {
     if (!fs.existsSync(dir)) continue;
     for (const entry of fs.readdirSync(dir)) {
