@@ -18,6 +18,7 @@ import { TRANSLATIONS, type Language } from '../i18n';
 import type { ClipRecord, ProcessingJob, Project, VideoRecord } from '../types';
 import { formatBytes, formatShortDate, formatTimecode } from '../utils/format';
 import { LanguageSwitch } from './LanguageSwitch';
+import { apiUrl, mediaUrl } from '../utils/api';
 
 interface ProjectsDashboardProps {
   projects: Project[];
@@ -363,7 +364,7 @@ export const ProjectsDashboard: React.FC<ProjectsDashboardProps> = ({
                 <div className="relative aspect-video w-full overflow-hidden bg-slate-900">
                   {video.thumbnailUrl ? (
                     <img
-                      src={video.thumbnailUrl}
+                      src={mediaUrl(video.thumbnailUrl)}
                       alt={video.title}
                       referrerPolicy="no-referrer"
                       className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.02]"
@@ -590,7 +591,7 @@ export const ProjectsDashboard: React.FC<ProjectsDashboardProps> = ({
                       <span>{t.modalOpenStudio}</span>
                     </button>
                     <a
-                      href={detailVideo.fileUrl}
+                      href={mediaUrl(detailVideo.fileUrl)}
                       download={detailVideo.originalName}
                       className="inline-flex items-center justify-center gap-2 rounded-lg border border-slate-200 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 dark:border-white/10 dark:text-slate-200 dark:hover:bg-white/5"
                     >
@@ -621,8 +622,8 @@ export const ProjectsDashboard: React.FC<ProjectsDashboardProps> = ({
                           <div className="relative aspect-video overflow-hidden rounded-md bg-slate-900">
                             {clip.exportedUrl ? (
                               <video
-                                src={clip.exportedUrl}
-                                poster={clip.thumbnailUrl ?? undefined}
+                                src={mediaUrl(clip.exportedUrl)}
+                                poster={mediaUrl(clip.thumbnailUrl) || undefined}
                                 controls
                                 preload="metadata"
                                 playsInline
@@ -630,7 +631,7 @@ export const ProjectsDashboard: React.FC<ProjectsDashboardProps> = ({
                               />
                             ) : clip.thumbnailUrl ? (
                               <img
-                                src={clip.thumbnailUrl}
+                                src={mediaUrl(clip.thumbnailUrl)}
                                 alt={clip.title}
                                 referrerPolicy="no-referrer"
                                 className="h-full w-full object-cover"
@@ -676,7 +677,7 @@ export const ProjectsDashboard: React.FC<ProjectsDashboardProps> = ({
 
                           {clip.exportedUrl ? (
                             <a
-                              href={`/api/clips/${clip.id}/download?format=mp4`}
+                              href={apiUrl(`/api/clips/${clip.id}/download?format=mp4`)}
                               className="flex-1 inline-flex items-center justify-center gap-1 rounded-md bg-emerald-500 py-1.5 text-xs font-semibold text-slate-950 hover:bg-emerald-400"
                             >
                               <Download className="h-3.5 w-3.5" />

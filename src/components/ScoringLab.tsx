@@ -3,6 +3,7 @@ import { CheckCircle2, Play, RotateCcw, Save, Upload } from 'lucide-react';
 import { TRANSLATIONS, type Language } from '../i18n';
 import type { ClipScoreBreakdown, ContextStatus, ScoringConfig, TranscriptSegment } from '../types';
 import { formatTimecode } from '../utils/format';
+import { apiUrl } from '../utils/api';
 import { LanguageSwitch } from './LanguageSwitch';
 
 interface ScoringLabProps {
@@ -83,7 +84,7 @@ export const ScoringLab: React.FC<ScoringLabProps> = ({
   const handleTest = async () => {
     setIsTesting(true);
     try {
-      const res = await fetch('/api/scoring-lab/test', {
+      const res = await fetch(apiUrl('/api/scoring-lab/test'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ transcript: testText, config: draft }),

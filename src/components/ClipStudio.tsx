@@ -36,6 +36,7 @@ import {
 } from '../utils/composition';
 import { formatBytes, formatTimecode } from '../utils/format';
 import { LanguageSwitch } from './LanguageSwitch';
+import { apiUrl, mediaUrl } from '../utils/api';
 
 interface ClipStudioProps {
   videos: VideoRecord[];
@@ -321,14 +322,14 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
 
   const resolvedVideoSrc = useMemo(() => {
     if (previewSource === 'compiled') {
-      return activeVariantExport?.exportedUrl ?? (activeVariant === 'vertical' ? draft?.exportedUrl ?? '' : '');
+      return mediaUrl(activeVariantExport?.exportedUrl ?? (activeVariant === 'vertical' ? draft?.exportedUrl ?? '' : ''));
     }
     if (!activeVideo?.fileUrl) return '';
     if (isUsingWindowedLive) {
       const fmt = fallbackMode === 'webm' ? 'webm' : 'mp4';
-      return `/api/videos/${activeVideo.id}/preview?start=${liveWindow.start}&end=${liveWindow.end}&format=${fmt}`;
+      return apiUrl(`/api/videos/${activeVideo.id}/preview?start=${liveWindow.start}&end=${liveWindow.end}&format=${fmt}`);
     }
-    return activeVideo.fileUrl;
+    return mediaUrl(activeVideo.fileUrl);
   }, [previewSource, activeVariantExport?.exportedUrl, draft?.exportedUrl, activeVariant, activeVideo, isUsingWindowedLive, fallbackMode, liveWindow.start, liveWindow.end]);
 
   useEffect(() => {
@@ -1172,19 +1173,6 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                     <span>{tc.save}</span>
                   </button>
 
-                  <button
-                    type="button"
-                    disabled={isCompiling}
-                    onClick={handleCompile}
-                    className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3.5 py-1.5 text-xs font-semibold text-slate-950 transition-colors hover:bg-emerald-400 disabled:opacity-50 whitespace-nowrap shrink-0"
-                  >
-                    {isCompiling ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <Film className="h-3.5 w-3.5" />
-                    )}
-                    <span>{isCompiling ? t.compiling : t.compileExport}</span>
-                  </button>
                 </div>
               </div>
 
@@ -1248,7 +1236,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                       </div>
 
                       <a
-                        href={`/api/clips/${draft.id}/download?format=mp4&variant=${activeVariant}`}
+                        href={apiUrl(`/api/clips/${draft.id}/download?format=mp4&variant=${activeVariant}`)}
                         className="inline-flex items-center gap-1 rounded-md bg-emerald-500 px-2.5 py-1 text-[11px] font-semibold text-slate-950 hover:bg-emerald-400"
                       >
                         <Download className="h-3 w-3" />
@@ -1256,7 +1244,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                       </a>
                       {draft.srtUrl && (
                         <a
-                          href={`/api/clips/${draft.id}/download?format=srt&variant=${activeVariant}`}
+                          href={apiUrl(`/api/clips/${draft.id}/download?format=srt&variant=${activeVariant}`)}
                           className="inline-flex items-center gap-1 rounded-md border border-slate-300 px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-100 dark:border-white/15 dark:text-slate-200 dark:hover:bg-white/5"
                         >
                           <Download className="h-3 w-3" />
@@ -1378,7 +1366,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                     <div className="relative flex h-full w-full flex-col items-center justify-center bg-slate-900 p-4 text-center">
                       {activeVideo.thumbnailUrl && (
                         <img
-                          src={activeVideo.thumbnailUrl}
+                          src={mediaUrl(activeVideo.thumbnailUrl)}
                           alt={activeVideo.title}
                           referrerPolicy="no-referrer"
                           className="absolute inset-0 h-full w-full object-cover opacity-35"
@@ -1431,12 +1419,12 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                     <div className="text-center text-[11px] font-semibold text-slate-200">
                       Resultado {activeVariant === 'vertical' ? 'vertical 9:16' : 'horizontal 16:9'}
                     </div>
-                    <div data-focus-canvas className={`relative w-full overflow-hidden rounded-lg ${
+                    <div data-focus-canvas className={`relative overflow-hidden rounded-lg ${
                       compositionView === 'preview'
-                        ? 'max-h-[500px] max-w-[720px]'
+                        ? 'w-full max-h-[500px] max-w-[720px]'
                         : isSubtitleEditing
-                        ? activeVariant === 'vertical' ? 'max-h-[650px] max-w-[366px]' : 'max-w-[1000px]'
-                        : 'max-h-[390px]'
+                        ? 'h-[clamp(320px,calc(100vh-430px),620px)] w-auto max-w-full'
+                        : 'w-full max-h-[390px]'
                     } ${activeVariant === 'vertical' ? 'aspect-[9/16]' : 'aspect-video'}`}>
                       <canvas
                         ref={compositionCanvasRef}
