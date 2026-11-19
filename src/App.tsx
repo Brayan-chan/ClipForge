@@ -195,8 +195,11 @@ export function App() {
     return updated;
   };
 
-  const handleCompileClip = async (clipId: number): Promise<ClipRecord> => {
-    const res = await fetch(`/api/clips/${clipId}/compile`, { method: 'POST' });
+  const handleCompileClip = async (
+    clipId: number,
+    variant: 'vertical' | 'horizontal' = 'vertical'
+  ): Promise<ClipRecord> => {
+    const res = await fetch(`/api/clips/${clipId}/compile?variant=${variant}`, { method: 'POST' });
     const data = await readJsonResponse<ClipRecord>(res);
     await fetchWorkspace();
     return data;

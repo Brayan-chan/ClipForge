@@ -3,6 +3,7 @@ import type {
   JobStage,
   TranscriptSegment,
 } from '../src/types';
+import { ensureClipCompositions } from '../src/utils/composition';
 import {
   DEFAULT_SUBTITLE_STYLE,
   mutateDb,
@@ -12,7 +13,6 @@ import {
 import { processingQueue } from './queue';
 import { extractMonoAudio } from './processing/audioExtractor';
 import {
-  detectCandidateClipsHeuristic,
   parseSrtOrTextTranscript,
   type CandidateClip,
 } from './processing/clipScorer';
@@ -22,6 +22,8 @@ import {
   transcribeAudioWithGemini,
 } from './processing/geminiClient';
 import { renderClipWithFfmpeg } from './processing/renderer';
+import { analyzeAudioEvents } from './processing/momentDetection/audioEvents';
+import { detectNarrativeMoments } from './processing/momentDetection/momentDetector';
 import {
   analyzeVideo,
   detectSceneChanges,
@@ -156,20 +158,24 @@ export async function runVideoPipeline(params: {
         });
       });
 
-      // Stage 4: Deterministic 100-pt Scoring + Optional Gemini Refinement with Deterministic Fallback
+      // Stage 4: Event-based deterministic detection + optional Gemini refinement.
       await updateJob(
         jobId,
         'scoring_moments',
         74,
-        'Running hook detection, context check & 100-pt deterministic rubric...'
+        'Detecting complete narrative events, reactions and natural speech boundaries...'
       );
 
       const config = readDb().scoringConfig;
-      let candidates: CandidateClip[] = detectCandidateClipsHeuristic(
+      const audioEvents = meta.hasAudio
+        ? await analyzeAudioEvents(videoPath, meta.duration)
+        : { energyPeaks: [], silenceEnds: [], available: false };
+      let candidates: CandidateClip[] = detectNarrativeMoments({
         segments,
         config,
-        sceneTimestamps
-      );
+        sceneTimestamps,
+        audio: audioEvents,
+      });
       let scoringSource: 'heuristic' | 'gemini' = 'heuristic';
       let fallbackNote = '';
 
@@ -243,6 +249,8 @@ export async function runVideoPipeline(params: {
             cropX: 50,
             cropY: 50,
             zoom: 1.0,
+            compositions: ensureClipCompositions({}),
+            exportVariants: {},
             subtitleStyle: { ...DEFAULT_SUBTITLE_STYLE },
             exportedUrl: null,
             srtUrl: null,
@@ -270,6 +278,7 @@ export async function runVideoPipeline(params: {
             videoPath,
             hasAudio: meta.hasAudio,
             segments,
+            variant: 'vertical',
           });
           renderedCount++;
           await mutateDb((db) => {
@@ -278,6 +287,7 @@ export async function runVideoPipeline(params: {
               target.exportedUrl = rendered.exportedUrl;
               target.srtUrl = rendered.srtUrl;
               target.exportedSizeBytes = rendered.exportedSizeBytes;
+              target.exportVariants = { vertical: rendered };
               if (rendered.thumbnailUrl) target.thumbnailUrl = rendered.thumbnailUrl;
               target.status = i === 0 ? 'approved' : 'exported';
             }

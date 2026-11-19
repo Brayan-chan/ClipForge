@@ -8,6 +8,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { createServer as createViteServer } from 'vite';
 import type { ClipRecord, ScoringConfig, TranscriptSegment } from './src/types';
+import { ensureClipCompositions, type CompositionVariant } from './src/utils/composition';
 import {
   CLIPS_DIR,
   DEFAULT_SUBTITLE_STYLE,
@@ -82,6 +83,36 @@ app.use('/storage/clips', express.static(CLIPS_DIR));
 app.use('/storage', (_req, res) => {
   res.status(404).json({ error: 'Not found' });
 });
+
+function removeClipArtifactsByIds(clipIds: Iterable<number>): number {
+  const ids = new Set(clipIds);
+  if (ids.size === 0) return 0;
+  let removed = 0;
+  for (const dir of [CLIPS_DIR, THUMBNAILS_DIR]) {
+    if (!fs.existsSync(dir)) continue;
+    for (const filename of fs.readdirSync(dir)) {
+      const match = filename.match(/^clip-(\d+)-/);
+      if (!match || !ids.has(Number(match[1]))) continue;
+      safeUnlink(path.join(dir, filename));
+      removed++;
+    }
+  }
+  return removed;
+}
+
+/** Removes renderer artifacts whose clip record no longer exists. */
+function reconcileOrphanedClipArtifacts(): number {
+  const liveIds = new Set(readDb().clips.map((clip) => clip.id));
+  const orphanIds = new Set<number>();
+  for (const dir of [CLIPS_DIR, THUMBNAILS_DIR]) {
+    if (!fs.existsSync(dir)) continue;
+    for (const filename of fs.readdirSync(dir)) {
+      const match = filename.match(/^clip-(\d+)-/);
+      if (match && !liveIds.has(Number(match[1]))) orphanIds.add(Number(match[1]));
+    }
+  }
+  return removeClipArtifactsByIds(orphanIds);
+}
 
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => {
@@ -1133,9 +1164,14 @@ app.delete('/api/videos/:id', async (req, res) => {
       }
     }
   }
-  for (const clip of db.clips.filter((c) => c.videoId === videoId)) {
+  const videoClips = db.clips.filter((c) => c.videoId === videoId);
+  for (const clip of videoClips) {
     if (clip.exportedUrl) safeUnlink(path.join(CLIPS_DIR, path.basename(clip.exportedUrl)));
     if (clip.srtUrl) safeUnlink(path.join(CLIPS_DIR, path.basename(clip.srtUrl)));
+    for (const variant of Object.values(clip.exportVariants ?? {})) {
+      if (variant?.exportedUrl) safeUnlink(path.join(CLIPS_DIR, path.basename(variant.exportedUrl)));
+      if (variant?.srtUrl) safeUnlink(path.join(CLIPS_DIR, path.basename(variant.srtUrl)));
+    }
   }
 
   await mutateDb((state) => {
@@ -1145,7 +1181,22 @@ app.delete('/api/videos/:id', async (req, res) => {
     state.processingJobs = state.processingJobs.filter((j) => j.videoId !== videoId);
   });
 
-  res.json({ ok: true });
+  let removedArtifacts = removeClipArtifactsByIds(videoClips.map((clip) => clip.id));
+  removedArtifacts += reconcileOrphanedClipArtifacts();
+  for (const filename of fs.readdirSync(THUMBNAILS_DIR)) {
+    if (filename.startsWith(`video-${videoId}-`)) {
+      safeUnlink(path.join(THUMBNAILS_DIR, filename));
+      removedArtifacts++;
+    }
+  }
+  for (const filename of fs.readdirSync(TRANSCRIPTS_DIR)) {
+    if (filename.startsWith(`video-${videoId}-`)) {
+      safeUnlink(path.join(TRANSCRIPTS_DIR, filename));
+      removedArtifacts++;
+    }
+  }
+
+  res.json({ ok: true, removedArtifacts });
 });
 
 app.patch('/api/transcriptions/:videoId', async (req, res) => {
@@ -1275,6 +1326,8 @@ app.post('/api/clips', async (req, res) => {
       cropX: 50,
       cropY: 50,
       zoom: 1.0,
+      compositions: ensureClipCompositions({}),
+      exportVariants: {},
       subtitleStyle: { ...DEFAULT_SUBTITLE_STYLE },
       exportedUrl: null,
       srtUrl: null,
@@ -1306,6 +1359,12 @@ app.patch('/api/clips/:id', async (req, res) => {
     if (typeof patch.cropX === 'number') clip.cropX = Math.min(100, Math.max(0, patch.cropX));
     if (typeof patch.cropY === 'number') clip.cropY = Math.min(100, Math.max(0, patch.cropY));
     if (typeof patch.zoom === 'number') clip.zoom = Math.min(2, Math.max(1, patch.zoom));
+    if (patch.compositions) {
+      clip.compositions = {
+        ...ensureClipCompositions(clip),
+        ...patch.compositions,
+      };
+    }
     if (patch.subtitleStyle) {
       clip.subtitleStyle = { ...clip.subtitleStyle, ...patch.subtitleStyle };
     }
@@ -1401,6 +1460,7 @@ app.post('/api/clips/:id/rescore', async (req, res) => {
 app.post('/api/clips/:id/compile', async (req, res) => {
   try {
     const clipId = Number(req.params.id);
+    const variant: CompositionVariant = req.query.variant === 'horizontal' ? 'horizontal' : 'vertical';
     const db = readDb();
     const clip = db.clips.find((c) => c.id === clipId);
     if (!clip) {
@@ -1422,6 +1482,7 @@ app.post('/api/clips/:id/compile', async (req, res) => {
         videoPath,
         hasAudio: video.hasAudio,
         segments: trans?.segments ?? [],
+        variant,
       })
     );
 
@@ -1432,6 +1493,11 @@ app.post('/api/clips/:id/compile', async (req, res) => {
       target.srtUrl = rendered.srtUrl;
       target.exportedSizeBytes = rendered.exportedSizeBytes;
       if (rendered.thumbnailUrl) target.thumbnailUrl = rendered.thumbnailUrl;
+      target.exportVariants = {
+        ...(target.exportVariants ?? {}),
+        [variant]: rendered,
+      };
+      target.aspectRatio = variant === 'vertical' ? '9:16' : '16:9';
       target.status = 'exported';
       return target;
     });
@@ -1453,7 +1519,11 @@ app.get('/api/clips/:id/download', (req, res) => {
     return;
   }
 
-  const targetUrl = format === 'srt' ? clip.srtUrl : clip.exportedUrl;
+  const variant: CompositionVariant = req.query.variant === 'horizontal' ? 'horizontal' : 'vertical';
+  const variantExport = clip.exportVariants?.[variant];
+  const targetUrl = format === 'srt'
+    ? variantExport?.srtUrl ?? clip.srtUrl
+    : variantExport?.exportedUrl ?? clip.exportedUrl;
   if (!targetUrl) {
     res.status(400).json({ error: 'Clip has not been compiled yet. Click Compile & Export first.' });
     return;
@@ -1476,10 +1546,15 @@ app.delete('/api/clips/:id', async (req, res) => {
   const clip = readDb().clips.find((c) => c.id === clipId);
   if (clip?.exportedUrl) safeUnlink(path.join(CLIPS_DIR, path.basename(clip.exportedUrl)));
   if (clip?.srtUrl) safeUnlink(path.join(CLIPS_DIR, path.basename(clip.srtUrl)));
+  for (const variant of Object.values(clip?.exportVariants ?? {})) {
+    if (variant?.exportedUrl) safeUnlink(path.join(CLIPS_DIR, path.basename(variant.exportedUrl)));
+    if (variant?.srtUrl) safeUnlink(path.join(CLIPS_DIR, path.basename(variant.srtUrl)));
+  }
   await mutateDb((db) => {
     db.clips = db.clips.filter((c) => c.id !== clipId);
   });
-  res.json({ ok: true });
+  const removedArtifacts = removeClipArtifactsByIds([clipId]) + reconcileOrphanedClipArtifacts();
+  res.json({ ok: true, removedArtifacts });
 });
 
 app.put('/api/scoring-config', async (req, res) => {
@@ -1517,6 +1592,7 @@ app.post('/api/storage/cleanup', (_req, res) => {
       }
     }
   }
+  removed += reconcileOrphanedClipArtifacts();
   res.json({ ok: true, removed, storageBytes: getStorageUsageBytes() });
 });
 

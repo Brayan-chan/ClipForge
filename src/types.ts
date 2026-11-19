@@ -1,5 +1,35 @@
 export type AspectRatio = '9:16' | '1:1' | '16:9';
 export type FramingMode = 'crop' | 'blur';
+export type CompositionLayout = 'focus' | 'stacked' | 'picture-in-picture';
+export type CompositionFocus = 'auto' | 'camera' | 'content' | 'split';
+
+export interface CompositionRegion {
+  /** Percentages relative to the source frame (0..100). */
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface ClipComposition {
+  aspectRatio: '9:16' | '16:9';
+  layout: CompositionLayout;
+  focus: CompositionFocus;
+  cameraEnabled: boolean;
+  camera: CompositionRegion;
+  content: CompositionRegion;
+  cameraPosition: 'top' | 'bottom';
+  cameraScale: number;
+  creditEnabled: boolean;
+  creditText: string;
+}
+
+export interface ClipExportVariant {
+  exportedUrl: string;
+  srtUrl: string;
+  exportedSizeBytes: number;
+  thumbnailUrl: string | null;
+}
 export type ClipStatus = 'candidate' | 'approved' | 'rejected' | 'exported';
 export type ContextStatus = 'self-contained' | 'partial' | 'needs-context';
 export type JobStage =
@@ -81,6 +111,8 @@ export interface SubtitleStyle {
   position: 'bottom' | 'center' | 'top';
   alignment: 'left' | 'center' | 'right';
   backgroundBox: boolean;
+  /** Editable subtitle area as percentages of the exported frame. */
+  region?: CompositionRegion;
 }
 
 export interface ClipRecord {
@@ -103,6 +135,11 @@ export interface ClipRecord {
   cropX: number; // 0..100
   cropY: number; // 0..100
   zoom: number; // 1.0..2.0
+  compositions?: {
+    vertical: ClipComposition;
+    horizontal: ClipComposition;
+  };
+  exportVariants?: Partial<Record<'vertical' | 'horizontal', ClipExportVariant>>;
   subtitleStyle: SubtitleStyle;
   exportedUrl: string | null;
   srtUrl: string | null;

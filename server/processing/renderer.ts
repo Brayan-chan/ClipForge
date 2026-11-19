@@ -2,16 +2,29 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createCanvas } from '@napi-rs/canvas';
 import type {
   AspectRatio,
+  ClipComposition,
   ClipRecord,
   SubtitleStyle,
   TranscriptSegment,
 } from '../../src/types';
+import { getClipComposition, type CompositionVariant } from '../../src/utils/composition';
 import { CLIPS_DIR, ensureStorageDirs } from '../db';
 import { generateThumbnail } from './videoAnalyzer';
 
 const execFileAsync = promisify(execFile);
+let assFilterSupport: Promise<boolean> | null = null;
+
+function supportsAssFilter(): Promise<boolean> {
+  if (!assFilterSupport) {
+    assFilterSupport = execFileAsync('ffmpeg', ['-hide_banner', '-filters'], { timeout: 10000 })
+      .then(({ stdout }) => /\bass\s+V->V\b/.test(stdout))
+      .catch(() => false);
+  }
+  return assFilterSupport;
+}
 
 function formatSrtTime(seconds: number): string {
   const s = Math.max(0, seconds);
@@ -83,7 +96,8 @@ function writeAssFile(
   clipSegments: TranscriptSegment[],
   style: SubtitleStyle,
   width: number,
-  height: number
+  height: number,
+  creditText = ''
 ): void {
   const scaledFontSize = Math.round((style.fontSize || 22) * (width / 420));
   const primaryColor = hexToAssBgr(style.textColor || '#FFFFFF', '00');
@@ -117,7 +131,7 @@ Style: Default,DejaVu Sans,${scaledFontSize},${primaryColor},${secondaryColor},$
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 `;
 
-  const events = clipSegments
+  const subtitleEvents = clipSegments
     .map((seg) => {
       const cleanText = seg.text
         .replace(/\\/g, '')
@@ -127,7 +141,152 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     })
     .join('\n');
 
+  const safeCredit = creditText
+    .replace(/\\/g, '')
+    .replace(/\{|\}/g, '')
+    .replace(/\r?\n/g, ' ')
+    .trim();
+  const creditEvent = safeCredit
+    ? `Dialogue: 1,0:00:00.00,9:59:59.00,Default,,0,0,0,,{\\an7\\fs${Math.max(18, Math.round(scaledFontSize * 0.55))}\\bord2\\shad1\\1c&HFFFFFF&\\3c&H000000&\\pos(${Math.round(width * 0.035)},${Math.round(height * 0.04)})}Source: ${safeCredit}`
+    : '';
+  const events = [subtitleEvents, creditEvent].filter(Boolean).join('\n');
+
   fs.writeFileSync(filePath, header + events + '\n', 'utf-8');
+}
+
+function writeTextOverlayPng(params: {
+  filePath: string;
+  width: number;
+  height: number;
+  text: string;
+  style: SubtitleStyle;
+  credit?: boolean;
+}): void {
+  const { filePath, width, height, text, style, credit = false } = params;
+  const canvas = createCanvas(width, height);
+  const ctx = canvas.getContext('2d');
+  const fontSize = credit
+    ? Math.max(20, Math.round(width * 0.025))
+    : Math.max(28, Math.round((style.fontSize || 22) * (width / 420)));
+  ctx.font = `700 ${fontSize}px sans-serif`;
+  ctx.textAlign = style.region && !credit
+    ? 'center'
+    : credit || style.alignment === 'left'
+    ? 'left'
+    : style.alignment === 'right'
+    ? 'right'
+    : 'center';
+  ctx.textBaseline = 'middle';
+
+  const region = style.region ?? {
+    x: 8,
+    y: style.position === 'top' ? 6 : style.position === 'center' ? 40 : 72,
+    width: 84,
+    height: 20,
+  };
+  const maxWidth = credit ? width * 0.88 : width * (region.width / 100) * 0.92;
+  const words = text.trim().split(/\s+/);
+  const lines: string[] = [];
+  let line = '';
+  for (const word of words) {
+    const candidate = line ? `${line} ${word}` : word;
+    if (ctx.measureText(candidate).width > maxWidth && line) {
+      lines.push(line);
+      line = word;
+    } else line = candidate;
+  }
+  if (line) lines.push(line);
+  const visibleLines = credit ? lines.slice(0, 1) : lines.slice(0, 3);
+  const lineHeight = fontSize * 1.2;
+  const blockHeight = credit
+    ? visibleLines.length * lineHeight + fontSize * 0.65
+    : Math.min(height * (region.height / 100), visibleLines.length * lineHeight + fontSize * 0.65);
+  const centerY = credit
+    ? height * 0.055
+    : height * ((region.y + region.height / 2) / 100);
+  const anchorX = style.region && !credit
+    ? width * ((region.x + region.width / 2) / 100)
+    : credit || style.alignment === 'left'
+    ? width * 0.06
+    : style.alignment === 'right'
+    ? width * 0.94
+    : width / 2;
+
+  if (style.backgroundBox || credit) {
+    ctx.fillStyle = 'rgba(0,0,0,0.70)';
+    ctx.fillRect(
+      credit ? width * 0.04 : width * (region.x / 100),
+      centerY - blockHeight / 2,
+      credit ? width * 0.92 : width * (region.width / 100),
+      blockHeight
+    );
+  }
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = Math.max(3, Math.round(fontSize * 0.12));
+  ctx.strokeStyle = '#000000';
+  ctx.fillStyle = credit ? '#FFFFFF' : style.textColor;
+  visibleLines.forEach((value, index) => {
+    const y = centerY + (index - (visibleLines.length - 1) / 2) * lineHeight;
+    ctx.strokeText(value, anchorX, y, maxWidth);
+    ctx.fillText(value, anchorX, y, maxWidth);
+  });
+  fs.writeFileSync(filePath, canvas.toBuffer('image/png'));
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function cropFilter(region: ClipComposition['camera']): string {
+  const width = clamp(region.width, 5, 100) / 100;
+  const height = clamp(region.height, 5, 100) / 100;
+  const x = clamp(region.x, 0, 100 - width * 100) / 100;
+  const y = clamp(region.y, 0, 100 - height * 100) / 100;
+  return `crop=iw*${width.toFixed(4)}:ih*${height.toFixed(4)}:iw*${x.toFixed(4)}:ih*${y.toFixed(4)}`;
+}
+
+function coverFilter(width: number, height: number): string {
+  return `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},setsar=1`;
+}
+
+function buildCompositionFilter(
+  composition: ClipComposition,
+  width: number,
+  height: number
+): string {
+  const contentCrop = cropFilter(composition.content);
+  const cameraCrop = cropFilter(composition.camera);
+
+  if (!composition.cameraEnabled) {
+    return `${contentCrop},${coverFilter(width, height)}`;
+  }
+
+  if (composition.layout === 'stacked') {
+    const cameraHeight = Math.round(height * clamp(composition.cameraScale, 20, 60) / 100);
+    const contentHeight = height - cameraHeight;
+    const topIsCamera = composition.cameraPosition === 'top';
+    return [
+      'split=2[contentSource][cameraSource]',
+      `[contentSource]${contentCrop},${coverFilter(width, contentHeight)}[content]`,
+      `[cameraSource]${cameraCrop},${coverFilter(width, cameraHeight)}[camera]`,
+      topIsCamera ? '[camera][content]vstack=inputs=2,setsar=1' : '[content][camera]vstack=inputs=2,setsar=1',
+    ].join(';');
+  }
+
+  if (composition.layout === 'picture-in-picture') {
+    const pipWidth = Math.round(width * clamp(composition.cameraScale, 18, 48) / 100);
+    const pipHeight = Math.max(2, Math.round(pipWidth * 9 / 16 / 2) * 2);
+    const overlayY = composition.cameraPosition === 'top' ? Math.round(height * 0.04) : `H-h-${Math.round(height * 0.04)}`;
+    return [
+      'split=2[contentSource][cameraSource]',
+      `[contentSource]${contentCrop},${coverFilter(width, height)}[content]`,
+      `[cameraSource]${cameraCrop},${coverFilter(pipWidth, pipHeight)}[camera]`,
+      `[content][camera]overlay=${Math.round(width * 0.04)}:${overlayY}:format=auto,setsar=1`,
+    ].join(';');
+  }
+
+  const region = composition.focus === 'camera' ? composition.camera : composition.content;
+  return `${cropFilter(region)},${coverFilter(width, height)}`;
 }
 
 export async function renderClipWithFfmpeg(params: {
@@ -135,6 +294,7 @@ export async function renderClipWithFfmpeg(params: {
   videoPath: string;
   hasAudio: boolean;
   segments: TranscriptSegment[];
+  variant?: CompositionVariant;
 }): Promise<{
   exportedUrl: string;
   srtUrl: string;
@@ -142,15 +302,18 @@ export async function renderClipWithFfmpeg(params: {
   exportedSizeBytes: number;
 }> {
   ensureStorageDirs();
-  const { clip, videoPath, hasAudio, segments } = params;
-  const { width, height } = getTargetDimensions(clip.aspectRatio);
+  const { clip, videoPath, hasAudio, segments, variant } = params;
+  const composition = variant ? getClipComposition(clip, variant) : null;
+  const aspectRatio = composition?.aspectRatio ?? clip.aspectRatio;
+  const { width, height } = getTargetDimensions(aspectRatio);
   const clipDuration = Math.max(1, clip.endTime - clip.startTime);
 
   const stamp = Date.now();
-  const mp4Name = `clip-${clip.id}-${stamp}.mp4`;
-  const srtName = `clip-${clip.id}-${stamp}.srt`;
-  const assName = `clip-${clip.id}-${stamp}.ass`;
-  const thumbName = `clip-${clip.id}-${stamp}.jpg`;
+  const variantTag = variant ? `-${variant}` : '';
+  const mp4Name = `clip-${clip.id}${variantTag}-${stamp}.mp4`;
+  const srtName = `clip-${clip.id}${variantTag}-${stamp}.srt`;
+  const assName = `clip-${clip.id}${variantTag}-${stamp}.ass`;
+  const thumbName = `clip-${clip.id}${variantTag}-${stamp}.jpg`;
 
   const mp4Path = path.join(CLIPS_DIR, mp4Name);
   const srtPath = path.join(CLIPS_DIR, srtName);
@@ -164,7 +327,9 @@ export async function renderClipWithFfmpeg(params: {
   const cropYRatio = Math.min(1, Math.max(0, (clip.cropY ?? 50) / 100));
 
   let videoFilter = '';
-  if (clip.framingMode === 'blur') {
+  if (composition) {
+    videoFilter = buildCompositionFilter(composition, width, height);
+  } else if (clip.framingMode === 'blur') {
     videoFilter = [
       `split=2[bg][fg]`,
       `[bg]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},boxblur=16:2[bgb]`,
@@ -177,13 +342,55 @@ export async function renderClipWithFfmpeg(params: {
     videoFilter = `scale=${scaledW}:${scaledH}:force_original_aspect_ratio=increase,crop=${width}:${height}:(iw-${width})*${cropXRatio.toFixed(3)}:(ih-${height})*${cropYRatio.toFixed(3)},setsar=1`;
   }
 
-  if (clip.subtitleStyle.enabled && clipSegments.length > 0) {
-    writeAssFile(assPath, clipSegments, clip.subtitleStyle, width, height);
+  const shouldBurnSubtitles = clip.subtitleStyle.enabled && clipSegments.length > 0;
+  const shouldBurnCredit = Boolean(composition?.creditEnabled && composition.creditText.trim());
+  const canBurnAss =
+    (shouldBurnSubtitles || shouldBurnCredit) &&
+    !clip.subtitleStyle.region &&
+    await supportsAssFilter();
+  const overlaySpecs: Array<{ path: string; start: number; end: number }> = [];
+  if (canBurnAss) {
+    writeAssFile(
+      assPath,
+      shouldBurnSubtitles ? clipSegments : [],
+      clip.subtitleStyle,
+      width,
+      height,
+      composition?.creditEnabled ? composition.creditText : ''
+    );
     const escapedAss = assPath.replace(/\\/g, '/').replace(/:/g, '\\:');
     if (clip.framingMode === 'blur') {
-      videoFilter = `${videoFilter},ass='${escapedAss}'`;
+      videoFilter = `${videoFilter},ass=filename='${escapedAss}'`;
     } else {
-      videoFilter = `${videoFilter},ass='${escapedAss}'`;
+      videoFilter = `${videoFilter},ass=filename='${escapedAss}'`;
+    }
+  } else if (shouldBurnSubtitles || shouldBurnCredit) {
+    // Portable fallback for FFmpeg builds without libass: render transparent
+    // subtitle cards as PNGs and time them with the standard overlay filter.
+    if (shouldBurnSubtitles) {
+      clipSegments.forEach((segment, index) => {
+        const overlayPath = path.join(CLIPS_DIR, `clip-${clip.id}-${stamp}-sub-${index}.png`);
+        writeTextOverlayPng({
+          filePath: overlayPath,
+          width,
+          height,
+          text: segment.text,
+          style: clip.subtitleStyle,
+        });
+        overlaySpecs.push({ path: overlayPath, start: segment.start, end: segment.end });
+      });
+    }
+    if (shouldBurnCredit && composition) {
+      const overlayPath = path.join(CLIPS_DIR, `clip-${clip.id}-${stamp}-credit.png`);
+      writeTextOverlayPng({
+        filePath: overlayPath,
+        width,
+        height,
+        text: `Fuente: ${composition.creditText}`,
+        style: clip.subtitleStyle,
+        credit: true,
+      });
+      overlaySpecs.push({ path: overlayPath, start: 0, end: clipDuration });
     }
   }
 
@@ -195,8 +402,26 @@ export async function renderClipWithFfmpeg(params: {
     clipDuration.toFixed(2),
     '-i',
     videoPath,
-    '-vf',
-    videoFilter,
+  ];
+
+  if (overlaySpecs.length > 0) {
+    for (const overlay of overlaySpecs) args.push('-loop', '1', '-i', overlay.path);
+    const chains: string[] = [`${videoFilter}[composition]`];
+    let previous = 'composition';
+    overlaySpecs.forEach((overlay, index) => {
+      const output = `overlay${index}`;
+      chains.push(
+        `[${previous}][${index + 1}:v]overlay=0:0:enable='between(t,${overlay.start.toFixed(3)},${overlay.end.toFixed(3)})'[${output}]`
+      );
+      previous = output;
+    });
+    args.push('-filter_complex', chains.join(';'), '-map', `[${previous}]`);
+    if (hasAudio) args.push('-map', '0:a?');
+  } else {
+    args.push('-vf', videoFilter);
+  }
+
+  args.push(
     '-r',
     '30',
     '-c:v',
@@ -209,7 +434,9 @@ export async function renderClipWithFfmpeg(params: {
     'yuv420p',
     '-movflags',
     '+faststart',
-  ];
+    '-t',
+    clipDuration.toFixed(2)
+  );
 
   if (hasAudio) {
     args.push('-c:a', 'aac', '-b:a', '128k');
@@ -219,11 +446,14 @@ export async function renderClipWithFfmpeg(params: {
 
   args.push(mp4Path);
 
-  await execFileAsync('ffmpeg', args, { timeout: 120000 });
-
-  // Clean up temporary .ass file after burn-in
-  if (fs.existsSync(assPath)) {
-    fs.unlinkSync(assPath);
+  try {
+    await execFileAsync('ffmpeg', args, { timeout: 120000 });
+  } finally {
+    // Always remove the temporary burn-in file, including failed renders.
+    if (fs.existsSync(assPath)) fs.unlinkSync(assPath);
+    for (const overlay of overlaySpecs) {
+      if (fs.existsSync(overlay.path)) fs.unlinkSync(overlay.path);
+    }
   }
 
   const stat = fs.statSync(mp4Path);

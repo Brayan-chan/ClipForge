@@ -20,15 +20,20 @@ import {
 } from 'lucide-react';
 import { TRANSLATIONS, type Language } from '../i18n';
 import type {
-  AspectRatio,
   ClipRecord,
-  FramingMode,
+  ClipComposition,
+  CompositionRegion,
   ScoringConfig,
   SubtitleStyle,
   TranscriptSegment,
   TranscriptionRecord,
   VideoRecord,
 } from '../types';
+import {
+  ensureClipCompositions,
+  getClipComposition,
+  type CompositionVariant,
+} from '../utils/composition';
 import { formatBytes, formatTimecode } from '../utils/format';
 import { LanguageSwitch } from './LanguageSwitch';
 
@@ -43,7 +48,7 @@ interface ClipStudioProps {
   onSelectVideo: (videoId: number) => void;
   onSelectClip: (clipId: number) => void;
   onUpdateClip: (clipId: number, patch: Partial<ClipRecord>) => Promise<ClipRecord>;
-  onCompileClip: (clipId: number) => Promise<ClipRecord>;
+  onCompileClip: (clipId: number, variant?: CompositionVariant) => Promise<ClipRecord>;
   onRescoreClip: (clipId: number, useAi: boolean) => Promise<ClipRecord>;
   onCreateClip: (videoId: number, startTime: number, endTime: number) => Promise<ClipRecord>;
   onDeleteClip: (clipId: number) => Promise<void>;
@@ -53,6 +58,98 @@ interface ClipStudioProps {
   lang: Language;
   onChangeLang: (lang: Language) => void;
 }
+
+const FocusRegionBox: React.FC<{
+  label: string;
+  color: 'cyan' | 'fuchsia' | 'emerald';
+  region: CompositionRegion;
+  onChange: (region: CompositionRegion) => void;
+}> = ({ label, color, region, onChange }) => {
+  const interaction = useRef<{
+    mode: 'move' | 'resize';
+    startX: number;
+    startY: number;
+    initial: CompositionRegion;
+    containerWidth: number;
+    containerHeight: number;
+  } | null>(null);
+
+  const begin = (event: React.PointerEvent<HTMLDivElement>, mode: 'move' | 'resize') => {
+    event.preventDefault();
+    event.stopPropagation();
+    const container = event.currentTarget.closest('[data-focus-canvas]')?.getBoundingClientRect();
+    if (!container) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    interaction.current = {
+      mode,
+      startX: event.clientX,
+      startY: event.clientY,
+      initial: { ...region },
+      containerWidth: container.width,
+      containerHeight: container.height,
+    };
+  };
+
+  const move = (event: React.PointerEvent<HTMLDivElement>) => {
+    const active = interaction.current;
+    if (!active) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const dx = ((event.clientX - active.startX) / active.containerWidth) * 100;
+    const dy = ((event.clientY - active.startY) / active.containerHeight) * 100;
+    if (active.mode === 'move') {
+      onChange({
+        ...active.initial,
+        x: Math.min(100 - active.initial.width, Math.max(0, active.initial.x + dx)),
+        y: Math.min(100 - active.initial.height, Math.max(0, active.initial.y + dy)),
+      });
+    } else {
+      onChange({
+        ...active.initial,
+        width: Math.min(100 - active.initial.x, Math.max(8, active.initial.width + dx)),
+        height: Math.min(100 - active.initial.y, Math.max(8, active.initial.height + dy)),
+      });
+    }
+  };
+
+  const end = (event: React.PointerEvent<HTMLDivElement>) => {
+    event.stopPropagation();
+    interaction.current = null;
+  };
+
+  const border = color === 'cyan' ? 'border-cyan-400' : color === 'emerald' ? 'border-emerald-400' : 'border-fuchsia-400';
+  const badge = color === 'cyan'
+    ? 'bg-cyan-400 text-slate-950'
+    : color === 'emerald'
+    ? 'bg-emerald-500 text-slate-950'
+    : 'bg-fuchsia-500 text-white';
+
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      aria-label={`${label}: drag to move, use the corner handle to resize`}
+      onPointerDown={(event) => begin(event, 'move')}
+      onPointerMove={move}
+      onPointerUp={end}
+      onPointerCancel={end}
+      className={`absolute touch-none cursor-move border-2 ${border} bg-black/5 shadow-[0_0_0_1px_rgba(0,0,0,0.45)]`}
+      style={{ left: `${region.x}%`, top: `${region.y}%`, width: `${region.width}%`, height: `${region.height}%` }}
+    >
+      <span className={`absolute left-0 top-0 px-2 py-1 text-[10px] font-bold tracking-wide ${badge}`}>
+        {label}
+      </span>
+      <div
+        onPointerDown={(event) => begin(event, 'resize')}
+        onPointerMove={move}
+        onPointerUp={end}
+        onPointerCancel={end}
+        className={`absolute -bottom-2 -right-2 h-5 w-5 cursor-nwse-resize rounded-sm border-2 border-white ${badge}`}
+        title="Resize"
+      />
+    </div>
+  );
+};
 
 export const ClipStudio: React.FC<ClipStudioProps> = ({
   videos,
@@ -159,11 +256,15 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
   );
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const compositionCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const previewDrawRef = useRef<() => void>(() => {});
   const pendingSeekRef = useRef<number | null>(null);
   const [inspectorTab, setInspectorTab] = useState<'score' | 'subtitles' | 'transcript'>('score');
   const [previewSource, setPreviewSource] = useState<'live' | 'compiled'>(
     activeClip?.exportedUrl ? 'compiled' : 'live'
   );
+  const [activeVariant, setActiveVariant] = useState<CompositionVariant>('vertical');
+  const [compositionView, setCompositionView] = useState<'edit' | 'preview'>('edit');
   const [hasLiveEdits, setHasLiveEdits] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
@@ -186,6 +287,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
   const [mediaError, setMediaError] = useState<string | null>(null);
   const [fallbackMode, setFallbackMode] = useState<'none' | 'mp4' | 'webm'>('none');
   const [isFallbackLoading, setIsFallbackLoading] = useState(false);
+  const [isDetectingCamera, setIsDetectingCamera] = useState(false);
   const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
   const computeWindowForRange = (startSec: number, endSec: number, totalDur: number) => {
@@ -202,10 +304,18 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
   const isUsingWindowedLive =
     previewSource === 'live' && Boolean(activeVideo) && (isLargeOrLongVideo || fallbackMode !== 'none');
   const windowOffset = isUsingWindowedLive ? liveWindow.start : 0;
+  const activeComposition = draft ? getClipComposition(draft, activeVariant) : null;
+  const activeVariantExport = draft?.exportVariants?.[activeVariant];
+  const subtitleRegion: CompositionRegion = draft?.subtitleStyle.region ?? {
+    x: 8,
+    y: 72,
+    width: 84,
+    height: 20,
+  };
 
   const resolvedVideoSrc = useMemo(() => {
-    if (previewSource === 'compiled' && draft?.exportedUrl) {
-      return draft.exportedUrl;
+    if (previewSource === 'compiled') {
+      return activeVariantExport?.exportedUrl ?? (activeVariant === 'vertical' ? draft?.exportedUrl ?? '' : '');
     }
     if (!activeVideo?.fileUrl) return '';
     if (isUsingWindowedLive) {
@@ -213,7 +323,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
       return `/api/videos/${activeVideo.id}/preview?start=${liveWindow.start}&end=${liveWindow.end}&format=${fmt}`;
     }
     return activeVideo.fileUrl;
-  }, [previewSource, draft?.exportedUrl, activeVideo, isUsingWindowedLive, fallbackMode, liveWindow.start, liveWindow.end]);
+  }, [previewSource, activeVariantExport?.exportedUrl, draft?.exportedUrl, activeVariant, activeVideo, isUsingWindowedLive, fallbackMode, liveWindow.start, liveWindow.end]);
 
   useEffect(() => {
     setFallbackMode('none');
@@ -223,6 +333,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
 
   useEffect(() => {
     setDraft(activeClip);
+    setActiveVariant('vertical');
     const startMode = activeClip?.exportedUrl ? 'compiled' : 'live';
     setPreviewSource(startMode);
     setHasLiveEdits(false);
@@ -268,6 +379,85 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
     }
     if (activeVideo && (next.startTime < liveWindow.start || next.endTime > liveWindow.end)) {
       setLiveWindow(computeWindowForRange(next.startTime, next.endTime, activeVideo.duration));
+    }
+  };
+
+  const updateComposition = (patch: Partial<ClipComposition>) => {
+    if (!draft) return;
+    const compositions = ensureClipCompositions(draft);
+    const nextComposition = { ...compositions[activeVariant], ...patch };
+    updateDraftLive({
+      ...draft,
+      aspectRatio: nextComposition.aspectRatio,
+      compositions: { ...compositions, [activeVariant]: nextComposition },
+    });
+  };
+
+  const updateSubtitleRegion = (region: CompositionRegion) => {
+    if (!draft) return;
+    const fontSize = Math.max(14, Math.min(42, Math.round(10 + region.height * 0.9)));
+    updateDraftLive({
+      ...draft,
+      subtitleStyle: { ...draft.subtitleStyle, region, fontSize, alignment: 'center' },
+    });
+  };
+
+  const handleAutoDetectCamera = async () => {
+    if (!draft || !activeComposition) return;
+    setIsDetectingCamera(true);
+    const fallbackCamera = { x: 2, y: 57, width: 28, height: 40 };
+    try {
+      const FaceDetectorCtor = (window as unknown as {
+        FaceDetector?: new (options?: { fastMode?: boolean; maxDetectedFaces?: number }) => {
+          detect: (source: CanvasImageSource) => Promise<Array<{ boundingBox: DOMRectReadOnly }>>;
+        };
+      }).FaceDetector;
+      const video = videoRef.current;
+      if (!FaceDetectorCtor || !video || video.readyState < 2 || !video.videoWidth) {
+        updateComposition({ focus: 'auto', cameraEnabled: true, camera: fallbackCamera });
+        setFeedback({ type: 'ok', text: 'Streamer camera preset applied. Adjust the magenta region if needed.' });
+        return;
+      }
+      const detector = new FaceDetectorCtor({ fastMode: true, maxDetectedFaces: 6 });
+      const faces = await detector.detect(video);
+      if (faces.length === 0) {
+        updateComposition({ focus: 'auto', cameraEnabled: true, camera: fallbackCamera });
+        setFeedback({ type: 'ok', text: 'No face found in this frame; streamer preset applied.' });
+        return;
+      }
+      // A facecam is usually a compact face region; prefer the face closest to a frame corner.
+      const vw = video.videoWidth;
+      const vh = video.videoHeight;
+      const face = [...faces].sort((a, b) => {
+        const cornerScore = (box: DOMRectReadOnly) => {
+          const cx = (box.x + box.width / 2) / vw;
+          const cy = (box.y + box.height / 2) / vh;
+          return Math.min(cx, 1 - cx) + Math.min(cy, 1 - cy);
+        };
+        return cornerScore(a.boundingBox) - cornerScore(b.boundingBox);
+      })[0].boundingBox;
+      const marginX = face.width * 1.7;
+      const marginY = face.height * 1.25;
+      const x = Math.max(0, face.x - marginX);
+      const y = Math.max(0, face.y - marginY);
+      const right = Math.min(vw, face.x + face.width + marginX);
+      const bottom = Math.min(vh, face.y + face.height + marginY);
+      updateComposition({
+        focus: 'camera',
+        cameraEnabled: true,
+        camera: {
+          x: (x / vw) * 100,
+          y: (y / vh) * 100,
+          width: ((right - x) / vw) * 100,
+          height: ((bottom - y) / vh) * 100,
+        },
+      });
+      setFeedback({ type: 'ok', text: 'Facecam detected. Review the magenta region before exporting.' });
+    } catch {
+      updateComposition({ focus: 'auto', cameraEnabled: true, camera: fallbackCamera });
+      setFeedback({ type: 'ok', text: 'Camera detection was unavailable; streamer preset applied.' });
+    } finally {
+      setIsDetectingCamera(false);
     }
   };
 
@@ -396,6 +586,151 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
     return segmentsDraft.find((seg) => sec >= seg.start && sec <= seg.end) ?? null;
   }, [segmentsDraft, currentTime, previewSource, draft]);
 
+  useEffect(() => {
+    const drawPreviewFrame = () => {
+      const canvas = compositionCanvasRef.current;
+      const video = videoRef.current;
+      if (!canvas || !video || !activeComposition || video.readyState < 2) return;
+
+      const isVertical = activeVariant === 'vertical';
+      const width = isVertical ? 360 : 640;
+      const height = isVertical ? 640 : 360;
+      if (canvas.width !== width) canvas.width = width;
+      if (canvas.height !== height) canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, width, height);
+
+    const drawRegion = (
+      region: CompositionRegion,
+      dx: number,
+      dy: number,
+      dw: number,
+      dh: number
+    ) => {
+      const sx = (region.x / 100) * video.videoWidth;
+      const sy = (region.y / 100) * video.videoHeight;
+      const sw = (region.width / 100) * video.videoWidth;
+      const sh = (region.height / 100) * video.videoHeight;
+      if (sw > 0 && sh > 0) ctx.drawImage(video, sx, sy, sw, sh, dx, dy, dw, dh);
+    };
+
+    if (!activeComposition.cameraEnabled) {
+      drawRegion(activeComposition.content, 0, 0, width, height);
+    } else if (activeComposition.layout === 'stacked') {
+      const cameraHeight = Math.round(height * activeComposition.cameraScale / 100);
+      const contentHeight = height - cameraHeight;
+      if (activeComposition.cameraPosition === 'top') {
+        drawRegion(activeComposition.camera, 0, 0, width, cameraHeight);
+        drawRegion(activeComposition.content, 0, cameraHeight, width, contentHeight);
+      } else {
+        drawRegion(activeComposition.content, 0, 0, width, contentHeight);
+        drawRegion(activeComposition.camera, 0, contentHeight, width, cameraHeight);
+      }
+    } else if (activeComposition.layout === 'picture-in-picture') {
+      drawRegion(activeComposition.content, 0, 0, width, height);
+      const pipWidth = Math.round(width * activeComposition.cameraScale / 100);
+      const pipHeight = Math.round(pipWidth * 9 / 16);
+      const margin = Math.round(width * 0.04);
+      const pipY = activeComposition.cameraPosition === 'top' ? margin : height - pipHeight - margin;
+      drawRegion(activeComposition.camera, margin, pipY, pipWidth, pipHeight);
+      ctx.strokeStyle = '#e879f9';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(margin, pipY, pipWidth, pipHeight);
+    } else {
+      drawRegion(
+        activeComposition.focus === 'camera' ? activeComposition.camera : activeComposition.content,
+        0,
+        0,
+        width,
+        height
+      );
+    }
+
+    const frameTime = previewSource === 'live'
+      ? windowOffset + video.currentTime
+      : (draft?.startTime ?? 0) + video.currentTime;
+    const frameSegment = segmentsDraft.find((segment) => frameTime >= segment.start && frameTime <= segment.end);
+    if (draft?.subtitleStyle.enabled && frameSegment?.text) {
+      const text = frameSegment.text.trim();
+      const region = draft.subtitleStyle.region ?? { x: 8, y: 72, width: 84, height: 20 };
+      const fontSize = Math.max(14, Math.round((draft.subtitleStyle.fontSize || 22) * (width / 420)));
+      ctx.font = `700 ${fontSize}px system-ui, sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      const maxWidth = width * (region.width / 100) * 0.92;
+      const words = text.split(/\s+/);
+      const lines: string[] = [];
+      let line = '';
+      for (const word of words) {
+        const candidate = line ? `${line} ${word}` : word;
+        if (ctx.measureText(candidate).width > maxWidth && line) {
+          lines.push(line);
+          line = word;
+        } else line = candidate;
+      }
+      if (line) lines.push(line);
+      const visibleLines = lines.slice(0, 3);
+      const blockHeight = Math.min(
+        height * (region.height / 100),
+        visibleLines.length * fontSize * 1.2 + 20
+      );
+      const centerX = width * ((region.x + region.width / 2) / 100);
+      const centerY = height * ((region.y + region.height / 2) / 100);
+      if (draft.subtitleStyle.backgroundBox) {
+        ctx.fillStyle = 'rgba(0,0,0,.72)';
+        ctx.fillRect(
+          width * (region.x / 100),
+          centerY - blockHeight / 2,
+          width * (region.width / 100),
+          blockHeight
+        );
+      }
+      ctx.fillStyle = draft.subtitleStyle.textColor;
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 5;
+      visibleLines.forEach((value, index) => {
+        const y = centerY + (index - (visibleLines.length - 1) / 2) * fontSize * 1.2;
+        ctx.strokeText(value, centerX, y, maxWidth);
+        ctx.fillText(value, centerX, y, maxWidth);
+      });
+    }
+    };
+
+    previewDrawRef.current = drawPreviewFrame;
+    drawPreviewFrame();
+  }, [activeComposition, activeVariant, currentTime, draft?.subtitleStyle, draft?.startTime, previewSource, segmentsDraft, windowOffset]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || previewSource !== 'live') return;
+    const frameVideo = video as unknown as {
+      requestVideoFrameCallback?: (callback: () => void) => number;
+      cancelVideoFrameCallback?: (handle: number) => void;
+    };
+    const requestVideoFrame = frameVideo.requestVideoFrameCallback?.bind(video);
+    const cancelVideoFrame = frameVideo.cancelVideoFrameCallback?.bind(video);
+    let stopped = false;
+    let handle = 0;
+    const drawNextFrame = () => {
+      if (stopped) return;
+      previewDrawRef.current();
+      if (requestVideoFrame) {
+        handle = requestVideoFrame(drawNextFrame);
+      } else {
+        handle = requestAnimationFrame(drawNextFrame);
+      }
+    };
+    drawNextFrame();
+    return () => {
+      stopped = true;
+      if (cancelVideoFrame && requestVideoFrame) {
+        cancelVideoFrame(handle);
+      } else cancelAnimationFrame(handle);
+    };
+  }, [resolvedVideoSrc, previewSource, compositionView]);
+
   const handleSaveDraft = async () => {
     if (!draft) return;
     setIsSaving(true);
@@ -411,6 +746,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
         cropX: draft.cropX,
         cropY: draft.cropY,
         zoom: draft.zoom,
+        compositions: ensureClipCompositions(draft),
         subtitleStyle: draft.subtitleStyle,
       });
       setDraft(updated);
@@ -423,7 +759,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
   };
 
   const handleCompile = async () => {
-    if (!draft) return;
+    if (!draft) return false;
     setIsCompiling(true);
     setFeedback(null);
     try {
@@ -436,25 +772,43 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
         cropX: draft.cropX,
         cropY: draft.cropY,
         zoom: draft.zoom,
+        compositions: ensureClipCompositions(draft),
         subtitleStyle: draft.subtitleStyle,
       });
-      const compiled = await onCompileClip(draft.id);
+      const compiled = await onCompileClip(draft.id, activeVariant);
       setDraft(compiled);
       setHasLiveEdits(false);
       setPreviewSource('compiled');
       setCurrentTime(0);
       setFeedback({
         type: 'ok',
-        text: `${t.compiledReady} (${compiled.aspectRatio} · ${formatBytes(compiled.exportedSizeBytes ?? 0)})`,
+        text: `${t.compiledReady} (${activeVariant === 'vertical' ? '9:16' : '16:9'} · ${formatBytes(compiled.exportVariants?.[activeVariant]?.exportedSizeBytes ?? compiled.exportedSizeBytes ?? 0)})`,
       });
+      return true;
     } catch (err) {
       setFeedback({
         type: 'err',
         text: err instanceof Error ? err.message : 'Compilation failed',
       });
+      return false;
     } finally {
       setIsCompiling(false);
     }
+  };
+
+  const handleShowFinalResult = async () => {
+    if (!draft || isCompiling) return;
+    setCompositionView('preview');
+    const hasCurrentExport = Boolean(
+      draft.exportVariants?.[activeVariant]?.exportedUrl ||
+        (activeVariant === 'vertical' && draft.exportedUrl)
+    );
+    if (hasLiveEdits || !hasCurrentExport) {
+      await handleCompile();
+      return;
+    }
+    setPreviewSource('compiled');
+    setCurrentTime(0);
   };
 
   const handleRescore = async (useAi: boolean) => {
@@ -689,38 +1043,101 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
               <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 px-4 py-2.5 dark:border-white/10">
                 <div className="flex flex-wrap items-center gap-2">
                   <div className="flex items-center gap-1 rounded-lg bg-slate-100 p-1 dark:bg-[#181B22]">
-                    {(['9:16', '1:1', '16:9'] as AspectRatio[]).map((ratio) => (
+                    {(['vertical', 'horizontal'] as CompositionVariant[]).map((variant) => (
                       <button
-                        key={ratio}
+                        key={variant}
                         type="button"
-                        onClick={() => updateDraftLive({ ...draft, aspectRatio: ratio })}
+                        onClick={() => {
+                          setActiveVariant(variant);
+                          setCompositionView('edit');
+                          const composition = getClipComposition(draft, variant);
+                          setDraft({ ...draft, aspectRatio: composition.aspectRatio });
+                          const hasExport = Boolean(
+                            draft.exportVariants?.[variant]?.exportedUrl ||
+                              (variant === 'vertical' && draft.exportedUrl)
+                          );
+                          setPreviewSource(hasExport ? 'compiled' : 'live');
+                          setCurrentTime(hasExport ? 0 : draft.startTime);
+                        }}
                         className={`rounded-md px-2.5 py-1 font-mono text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                          draft.aspectRatio === ratio
+                          activeVariant === variant
                             ? 'bg-white text-slate-900 shadow-sm dark:bg-[#252A36] dark:text-white'
                             : 'text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white'
                         }`}
                       >
-                        {ratio}
+                        {variant === 'vertical' ? 'Vertical 9:16' : 'Horizontal 16:9'}
                       </button>
                     ))}
                   </div>
 
-                  <div className="flex items-center gap-1 rounded-lg bg-slate-100 p-1 dark:bg-[#181B22]">
-                    {(['crop', 'blur'] as FramingMode[]).map((fm) => (
+                  <div className="flex items-stretch gap-1 rounded-lg bg-slate-100 p-1 dark:bg-[#181B22]">
+                    {(['focus', 'stacked', 'picture-in-picture'] as const).map((layout) => (
                       <button
-                        key={fm}
+                        key={layout}
                         type="button"
-                        onClick={() => updateDraftLive({ ...draft, framingMode: fm })}
-                        className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
-                          draft.framingMode === fm
+                        onClick={() => {
+                          updateComposition({
+                            layout,
+                            focus: layout === 'focus' ? 'content' : 'split',
+                            cameraEnabled: layout !== 'focus',
+                          });
+                          setFeedback({
+                            type: 'ok',
+                            text: layout === 'focus'
+                              ? 'Una zona ocupará todo el clip.'
+                              : layout === 'stacked'
+                              ? 'Cámara y contenido aparecerán uno sobre otro.'
+                              : 'La cámara aparecerá flotando sobre el contenido.',
+                          });
+                        }}
+                        title={layout === 'focus'
+                          ? 'Una sola región llena todo el formato'
+                          : layout === 'stacked'
+                          ? 'Cámara y contenido divididos verticalmente'
+                          : 'Cámara pequeña encima del contenido'}
+                        className={`flex flex-col rounded-md px-2.5 py-1 text-left text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 ${
+                          activeComposition?.layout === layout
                             ? 'bg-white text-slate-900 shadow-sm dark:bg-[#252A36] dark:text-white'
                             : 'text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white'
                         }`}
                       >
-                        {fm === 'crop' ? t.smartCrop : t.blurFit}
+                        <span className="font-semibold">
+                          {layout === 'focus' ? 'Original / una zona' : layout === 'stacked' ? 'Apilado' : 'Cámara flotante'}
+                        </span>
+                        <span className="text-[9px] opacity-65">
+                          {layout === 'focus' ? 'Llena la pantalla' : layout === 'stacked' ? 'Dos bloques' : 'Sobre el contenido'}
+                        </span>
                       </button>
                     ))}
                   </div>
+
+                  {activeComposition?.layout === 'focus' && (
+                    <div className="flex items-center gap-1 rounded-lg bg-slate-100 p-1 dark:bg-[#181B22]">
+                      {(['content', 'camera'] as const).map((focus) => (
+                        <button key={focus} type="button" onClick={() => updateComposition({
+                          focus,
+                          cameraEnabled: focus === 'camera',
+                        })}
+                          className={`rounded-md px-2 py-1 text-[11px] font-medium ${
+                            activeComposition.focus === focus
+                              ? 'bg-white text-slate-900 shadow-sm dark:bg-[#252A36] dark:text-white'
+                              : 'text-slate-500 dark:text-slate-400'
+                          }`}>
+                          {focus === 'content' ? 'Usar contenido' : 'Usar cámara'}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  {activeComposition && activeComposition.layout !== 'focus' && (
+                    <button type="button"
+                      onClick={() => updateComposition({
+                        cameraPosition: activeComposition.cameraPosition === 'top' ? 'bottom' : 'top',
+                      })}
+                      className="rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-medium text-slate-600 dark:border-white/10 dark:text-slate-300">
+                      Cámara {activeComposition.cameraPosition === 'top' ? 'arriba' : 'abajo'} · cambiar
+                    </button>
+                  )}
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
@@ -752,7 +1169,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                 </div>
               </div>
 
-              {(feedback || draft.exportedUrl || hasLiveEdits) && (
+              {(feedback || activeVariantExport?.exportedUrl || (activeVariant === 'vertical' && draft.exportedUrl) || hasLiveEdits) && (
                 <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-slate-50 px-4 py-2 text-xs dark:border-white/10 dark:bg-white/[0.02]">
                   <div className="flex items-center gap-2">
                     {feedback && (
@@ -771,14 +1188,14 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                         {t.pendingRecompile}
                       </span>
                     )}
-                    {!feedback && !hasLiveEdits && draft.exportedUrl && (
+                    {!feedback && !hasLiveEdits && (activeVariantExport?.exportedUrl || (activeVariant === 'vertical' && draft.exportedUrl)) && (
                       <span className="text-emerald-600 dark:text-emerald-400">
                         {t.compiledReady} ({formatBytes(draft.exportedSizeBytes ?? 0)})
                       </span>
                     )}
                   </div>
 
-                  {draft.exportedUrl && (
+                  {(activeVariantExport?.exportedUrl || (activeVariant === 'vertical' && draft.exportedUrl)) && (
                     <div className="flex items-center gap-2">
                       <div className="flex items-center gap-1 rounded-md bg-slate-200/70 p-0.5 dark:bg-[#181B22]">
                         <button
@@ -812,7 +1229,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                       </div>
 
                       <a
-                        href={`/api/clips/${draft.id}/download?format=mp4`}
+                        href={`/api/clips/${draft.id}/download?format=mp4&variant=${activeVariant}`}
                         className="inline-flex items-center gap-1 rounded-md bg-emerald-500 px-2.5 py-1 text-[11px] font-semibold text-slate-950 hover:bg-emerald-400"
                       >
                         <Download className="h-3 w-3" />
@@ -820,7 +1237,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                       </a>
                       {draft.srtUrl && (
                         <a
-                          href={`/api/clips/${draft.id}/download?format=srt`}
+                          href={`/api/clips/${draft.id}/download?format=srt&variant=${activeVariant}`}
                           className="inline-flex items-center gap-1 rounded-md border border-slate-300 px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-100 dark:border-white/15 dark:text-slate-200 dark:hover:bg-white/5"
                         >
                           <Download className="h-3 w-3" />
@@ -833,10 +1250,83 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
               )}
 
               {/* Video Stage */}
-              <div className="flex flex-1 items-center justify-center overflow-hidden bg-slate-950 p-4">
+              <div className="relative flex min-h-0 flex-1 flex-col items-center justify-start gap-3 overflow-x-hidden overflow-y-auto bg-slate-950 p-4">
+                {previewSource === 'live' && (
+                  <div className="sticky top-0 z-30 flex w-full shrink-0 items-center justify-between gap-3 border-b border-white/10 bg-slate-950/95 pb-3 text-[11px] text-slate-300 backdrop-blur">
+                    <span>
+                      {compositionView === 'edit'
+                        ? 'Arrastra las cajas sobre el video original. Usa la esquina para cambiar su tamaño.'
+                        : 'Previsualización final con encuadre y subtítulos.'}
+                    </span>
+                    <div className="flex flex-wrap justify-end gap-2">
+                      <div className="flex rounded-md bg-white/10 p-0.5">
+                        {(['edit', 'preview'] as const).map((view) => (
+                          <button
+                            key={view}
+                            type="button"
+                            disabled={isCompiling}
+                            onClick={() => {
+                              if (view === 'preview') {
+                                void handleShowFinalResult();
+                              } else {
+                                setCompositionView('edit');
+                                setPreviewSource('live');
+                                setCurrentTime(draft.startTime);
+                              }
+                            }}
+                            className={`rounded px-2.5 py-1 font-semibold ${compositionView === view ? 'bg-white text-slate-950' : 'text-slate-300'}`}>
+                            {view === 'edit' ? (
+                              'Editar áreas'
+                            ) : isCompiling ? (
+                              <span className="inline-flex items-center gap-1.5">
+                                <Loader2 className="h-3 w-3 animate-spin" />
+                                Compilando…
+                              </span>
+                            ) : (
+                              'Compilar y ver resultado'
+                            )}
+                          </button>
+                        ))}
+                      </div>
+                      {compositionView === 'edit' && activeComposition?.cameraEnabled && (
+                        <button type="button" onClick={() => updateComposition({ cameraEnabled: false, layout: 'focus', focus: 'content' })}
+                          className="rounded-md border border-red-400/50 px-2.5 py-1 font-semibold text-red-300 hover:bg-red-400/10">
+                          Eliminar cámara
+                        </button>
+                      )}
+                      {compositionView === 'edit' && (
+                        <button
+                          type="button"
+                          onClick={handleAutoDetectCamera}
+                          disabled={isDetectingCamera}
+                          className="shrink-0 rounded-md border border-emerald-400/50 px-2.5 py-1 font-semibold text-emerald-300 hover:bg-emerald-400/10 disabled:opacity-50"
+                        >
+                          {isDetectingCamera ? 'Detectando…' : activeComposition?.cameraEnabled ? 'Volver a detectar' : 'Añadir cámara'}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+                {isCompiling && compositionView === 'preview' && (
+                  <div className="absolute inset-0 z-20 flex items-center justify-center bg-slate-950/85 backdrop-blur-sm">
+                    <div className="flex flex-col items-center gap-3 rounded-xl border border-white/10 bg-black/50 px-6 py-5 text-center text-slate-100 shadow-2xl">
+                      <Loader2 className="h-8 w-8 animate-spin text-emerald-400" />
+                      <div>
+                        <div className="text-sm font-semibold">Compilando resultado final</div>
+                        <div className="mt-1 text-xs text-slate-400">Aplicando encuadre, cámara y subtítulos al MP4…</div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+                <div className={`grid w-full shrink-0 items-center gap-4 ${previewSource === 'live' && compositionView === 'edit' ? 'lg:grid-cols-[minmax(0,1fr)_210px]' : 'place-items-center'}`}>
                 <div
+                  data-focus-canvas
                   className={`relative overflow-hidden rounded-lg border border-white/15 bg-black shadow-2xl ${
-                    draft.aspectRatio === '9:16'
+                    previewSource === 'live' && compositionView === 'preview'
+                      ? 'absolute h-px w-px overflow-hidden opacity-0 pointer-events-none'
+                      : previewSource === 'live'
+                      ? 'aspect-video w-full'
+                      : draft.aspectRatio === '9:16'
                       ? 'aspect-[9/16] h-full max-h-[430px]'
                       : draft.aspectRatio === '1:1'
                       ? 'aspect-square h-full max-h-[410px]'
@@ -863,20 +1353,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                       onEnded={() => setIsPlaying(false)}
                       onClick={togglePlay}
                       className="h-full w-full cursor-pointer"
-                      style={
-                        previewSource === 'compiled'
-                          ? { objectFit: 'contain' }
-                          : draft.framingMode === 'blur'
-                          ? {
-                              objectFit: 'contain',
-                              transform: `scale(${draft.zoom})`,
-                            }
-                          : {
-                              objectFit: 'cover',
-                              objectPosition: `${draft.cropX}% ${draft.cropY}%`,
-                              transform: `scale(${draft.zoom})`,
-                            }
-                      }
+                      style={{ objectFit: 'contain' }}
                     />
                   ) : (
                     <div className="relative flex h-full w-full flex-col items-center justify-center bg-slate-900 p-4 text-center">
@@ -897,6 +1374,25 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                     </div>
                   )}
 
+                  {previewSource === 'live' && compositionView === 'edit' && activeComposition && !mediaError && (
+                    <div className="absolute inset-0">
+                      <FocusRegionBox
+                        label="CONTENIDO"
+                        color="cyan"
+                        region={activeComposition.content}
+                        onChange={(content) => updateComposition({ content })}
+                      />
+                      {activeComposition.cameraEnabled && (
+                        <FocusRegionBox
+                          label="CÁMARA"
+                          color="fuchsia"
+                          region={activeComposition.camera}
+                          onChange={(camera) => updateComposition({ camera })}
+                        />
+                      )}
+                    </div>
+                  )}
+
                   {isFallbackLoading && !mediaError && (
                     <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/60 p-4">
                       <div className="flex items-center gap-2 rounded-md bg-black/80 px-3 py-2 text-xs text-slate-200">
@@ -906,57 +1402,37 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                     </div>
                   )}
 
-                  {previewSource === 'live' &&
-                    draft.subtitleStyle.enabled &&
-                    activeSegment && (
-                      <div
-                        className={`pointer-events-none absolute inset-x-4 flex ${
-                          draft.subtitleStyle.position === 'top'
-                            ? 'top-6'
-                            : draft.subtitleStyle.position === 'center'
-                            ? 'top-1/2 -translate-y-1/2'
-                            : 'bottom-6'
-                        } ${
-                          draft.subtitleStyle.alignment === 'left'
-                            ? 'justify-start text-left'
-                            : draft.subtitleStyle.alignment === 'right'
-                            ? 'justify-end text-right'
-                            : 'justify-center text-center'
-                        }`}
-                      >
-                        <div
-                          className={`max-w-[92%] rounded-md px-3 py-1.5 font-display font-bold leading-snug ${
-                            draft.subtitleStyle.backgroundBox ? 'bg-black/75' : ''
-                          }`}
-                          style={{
-                            fontSize: `${Math.max(12, Math.round(draft.subtitleStyle.fontSize * 0.72))}px`,
-                            color: draft.subtitleStyle.textColor,
-                            textShadow: draft.subtitleStyle.backgroundBox
-                              ? 'none'
-                              : '0 2px 6px rgba(0,0,0,0.95)',
-                          }}
-                        >
-                          {activeSegment.text.split(/\s+/).map((word, idx, arr) => {
-                            const segDur = Math.max(0.5, activeSegment.end - activeSegment.start);
-                            const progress = (currentTime - activeSegment.start) / segDur;
-                            const activeWordIdx = Math.floor(progress * arr.length);
-                            const isWordActive = idx === activeWordIdx;
-                            return (
-                              <span
-                                key={`${activeSegment.id}-${idx}`}
-                                style={{
-                                  color: isWordActive
-                                    ? draft.subtitleStyle.highlightColor
-                                    : draft.subtitleStyle.textColor,
-                                }}
-                              >
-                                {word}{' '}
-                              </span>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    )}
+                </div>
+                {previewSource === 'live' && (
+                  <div className={`flex flex-col items-center gap-2 ${
+                    compositionView === 'preview'
+                      ? activeVariant === 'vertical' ? 'w-full max-w-[320px]' : 'w-full max-w-[760px]'
+                      : 'w-full'
+                  }`}>
+                    <div className="text-center text-[11px] font-semibold text-slate-200">
+                      Resultado {activeVariant === 'vertical' ? 'vertical 9:16' : 'horizontal 16:9'}
+                    </div>
+                    <div className={`relative w-full overflow-hidden rounded-lg ${
+                      compositionView === 'preview' ? 'max-h-[500px] max-w-[720px]' : 'max-h-[390px]'
+                    } ${activeVariant === 'vertical' ? 'aspect-[9/16]' : 'aspect-video'}`}>
+                      <canvas
+                        ref={compositionCanvasRef}
+                        className="block h-full w-full border border-white/15 bg-black shadow-xl"
+                      />
+                      {inspectorTab === 'subtitles' && draft.subtitleStyle.enabled && compositionView === 'edit' && (
+                        <FocusRegionBox
+                          label="SUBTÍTULOS"
+                          color="emerald"
+                          region={subtitleRegion}
+                          onChange={updateSubtitleRegion}
+                        />
+                      )}
+                    </div>
+                    <div className="text-center text-[10px] leading-relaxed text-slate-400">
+                      Esta vista incluye encuadre y subtítulos antes de exportar.
+                    </div>
+                  </div>
+                )}
                 </div>
               </div>
 
@@ -1126,6 +1602,29 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
 
         {/* RIGHT INSPECTOR */}
         <aside className="flex flex-col rounded-xl border border-slate-200 bg-white dark:border-white/10 dark:bg-[#111318] lg:h-[calc(100vh-104px)]">
+          {draft && activeComposition && (
+            <div className="space-y-2 border-b border-slate-200 p-3 dark:border-white/10">
+              <div className="text-xs font-semibold text-slate-900 dark:text-white">Composición del clip</div>
+              <p className="text-[11px] leading-relaxed text-slate-500">
+                Define Cámara y Contenido arrastrando las cajas directamente sobre el video horizontal.
+              </p>
+              <label className="flex items-center gap-2 text-[11px] font-medium text-slate-700 dark:text-slate-200">
+                <input type="checkbox" checked={activeComposition.creditEnabled}
+                  onChange={(e) => updateComposition({ creditEnabled: e.target.checked })}
+                  className="accent-emerald-500" />
+                Mostrar crédito del creador
+              </label>
+              {activeComposition.creditEnabled && (
+                <input
+                  type="text"
+                  value={activeComposition.creditText}
+                  onChange={(e) => updateComposition({ creditText: e.target.value })}
+                  placeholder="@creator · twitch.tv/creator"
+                  className="w-full rounded-md border border-slate-200 bg-slate-50 px-2 py-1.5 text-xs dark:border-white/10 dark:bg-[#181B22]"
+                />
+              )}
+            </div>
+          )}
           <div className="border-b border-slate-200 p-2 dark:border-white/10">
             <div className="grid grid-cols-3 gap-1 rounded-lg bg-slate-100 p-1 dark:bg-[#181B22]">
               {(['score', 'subtitles', 'transcript'] as const).map((tab) => (
@@ -1332,7 +1831,29 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                   ))}
                 </div>
 
-                <div className="space-y-3 border-t border-slate-200 pt-4 dark:border-white/10">
+                {draft.subtitleStyle.enabled && (
+                  <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-3 text-xs leading-relaxed text-emerald-800 dark:text-emerald-200">
+                    <div className="font-semibold">Coloca los subtítulos directamente en el video</div>
+                    <div className="mt-1 opacity-80">
+                      Arrastra la caja verde para moverlos. Usa la esquina para cambiar su tamaño.
+                    </div>
+                    {previewSource === 'compiled' && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setPreviewSource('live');
+                          setCompositionView('edit');
+                          setCurrentTime(draft.startTime);
+                        }}
+                        className="mt-2 rounded-md bg-emerald-500 px-2.5 py-1 font-semibold text-slate-950"
+                      >
+                        Editar posición
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                <div className="hidden">
                   <div>
                     <div className="mb-1 flex justify-between text-xs">
                       <span className="text-slate-500 dark:text-slate-400">{t.fontSize}</span>
@@ -1477,7 +1998,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                   </label>
                 </div>
 
-                <div className="space-y-3 border-t border-slate-200 pt-4 dark:border-white/10">
+                <div className="hidden">
                   <div className="text-xs font-semibold text-slate-900 dark:text-white">
                     {t.cropFocusZoom}
                   </div>

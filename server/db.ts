@@ -36,6 +36,7 @@ export const DEFAULT_SUBTITLE_STYLE: SubtitleStyle = {
   position: 'bottom',
   alignment: 'center',
   backgroundBox: true,
+  region: { x: 8, y: 72, width: 84, height: 20 },
 };
 
 export const DEFAULT_SCORING_CONFIG: ScoringConfig = {
