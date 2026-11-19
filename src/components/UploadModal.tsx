@@ -18,6 +18,7 @@ import { TRANSLATIONS, type Language } from '../i18n';
 import type { ClipRecord, ProcessingJob, Project } from '../types';
 import { formatBytes, formatTimecode } from '../utils/format';
 import { ApiError, readJsonResponse } from '../utils/http';
+import { apiUrl, mediaUrl } from '../utils/api';
 
 interface UploadModalProps {
   isOpen: boolean;
@@ -93,7 +94,7 @@ async function uploadChunkWithRetry(
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const chunkRes = await fetch(
-        `/api/videos/upload/chunk/${uploadId}?index=${index}&offset=${offset}`,
+        apiUrl(`/api/videos/upload/chunk/${uploadId}?index=${index}&offset=${offset}`),
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/octet-stream' },
@@ -226,7 +227,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
       setIsSubmitting(true);
       setError(null);
       try {
-        const res = await fetch('/api/videos/from-url', {
+        const res = await fetch(apiUrl('/api/videos/from-url'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -284,7 +285,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
           finalizing: false,
         });
 
-        const presignRes = await fetch('/api/uploads/presign', {
+        const presignRes = await fetch(apiUrl('/api/uploads/presign'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -315,7 +316,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
           finalizing: true,
         });
 
-        const regRes = await fetch('/api/videos/from-storage', {
+        const regRes = await fetch(apiUrl('/api/videos/from-storage'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -334,7 +335,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
       }
 
       setUploadTarget('chunks');
-      const initRes = await fetch('/api/videos/upload/init', {
+      const initRes = await fetch(apiUrl('/api/videos/upload/init'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -406,7 +407,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
         finalizing: true,
       });
 
-      const completeRes = await fetch(`/api/videos/upload/complete/${uploadId}`, {
+      const completeRes = await fetch(apiUrl(`/api/videos/upload/complete/${uploadId}`), {
         method: 'POST',
       });
       const data = await readJsonResponse<{ video: { id: number }; job: ProcessingJob }>(
@@ -415,7 +416,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
       onVideoCreated(data.video.id, data.job);
     } catch (err) {
       if (uploadId) {
-        void fetch(`/api/videos/upload/${uploadId}`, { method: 'DELETE' });
+        void fetch(apiUrl(`/api/videos/upload/${uploadId}`), { method: 'DELETE' });
       }
       setError(err instanceof Error ? err.message : 'Upload failed');
     } finally {
@@ -429,7 +430,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
     setError(null);
     setYoutubeFallback(false);
     try {
-      const res = await fetch('/api/videos/demo', {
+      const res = await fetch(apiUrl('/api/videos/demo'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -591,7 +592,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
                         <div className="h-12 w-20 shrink-0 overflow-hidden rounded bg-slate-900">
                           {clip.thumbnailUrl ? (
                             <img
-                              src={clip.thumbnailUrl}
+                              src={mediaUrl(clip.thumbnailUrl)}
                               alt={clip.title}
                               referrerPolicy="no-referrer"
                               className="h-full w-full object-cover"
@@ -626,7 +627,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
                       <div className="flex items-center gap-1.5 shrink-0">
                         {clip.exportedUrl && (
                           <a
-                            href={`/api/clips/${clip.id}/download?format=mp4`}
+                            href={apiUrl(`/api/clips/${clip.id}/download?format=mp4`)}
                             className="inline-flex items-center gap-1 rounded-md bg-emerald-500 px-2.5 py-1.5 text-xs font-semibold text-slate-950 hover:bg-emerald-400 whitespace-nowrap"
                           >
                             <span>MP4</span>

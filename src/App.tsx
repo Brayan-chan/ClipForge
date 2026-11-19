@@ -7,6 +7,7 @@ import { PipelineView } from './components/PipelineView';
 import { UploadModal } from './components/UploadModal';
 import type { Language } from './i18n';
 import { readJsonResponse } from './utils/http';
+import { apiUrl } from './utils/api';
 import type {
   ClipRecord,
   ProcessingJob,
@@ -82,8 +83,8 @@ export function App() {
 
   const fetchWorkspace = useCallback(async () => {
     const [wsRes, statusRes] = await Promise.all([
-      fetch('/api/workspace'),
-      fetch('/api/status'),
+      fetch(apiUrl('/api/workspace')),
+      fetch(apiUrl('/api/status')),
     ]);
     if (wsRes.ok) {
       const ws = (await wsRes.json()) as {
@@ -138,7 +139,7 @@ export function App() {
   };
 
   const handleGenerateDemo = async () => {
-    const res = await fetch('/api/videos/demo', {
+    const res = await fetch(apiUrl('/api/videos/demo'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ projectId: projects[0]?.id ?? 1, useAi: false }),
@@ -163,7 +164,7 @@ export function App() {
   };
 
   const handleDeleteVideo = async (videoId: number) => {
-    const res = await fetch(`/api/videos/${videoId}`, { method: 'DELETE' });
+    const res = await fetch(apiUrl(`/api/videos/${videoId}`), { method: 'DELETE' });
     const result = await readJsonResponse<{ removedArtifacts: number; removedBytes: number }>(res);
     if (selectedVideoId === videoId) {
       setSelectedVideoId(null);
@@ -174,7 +175,7 @@ export function App() {
   };
 
   const handleRetryVideo = async (videoId: number) => {
-    const res = await fetch(`/api/videos/${videoId}/retry`, {
+    const res = await fetch(apiUrl(`/api/videos/${videoId}/retry`), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ useAi: false }),
@@ -187,7 +188,7 @@ export function App() {
   };
 
   const handleUpdateClip = async (clipId: number, patch: Partial<ClipRecord>): Promise<ClipRecord> => {
-    const res = await fetch(`/api/clips/${clipId}`, {
+    const res = await fetch(apiUrl(`/api/clips/${clipId}`), {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch),
@@ -201,14 +202,14 @@ export function App() {
     clipId: number,
     variant: 'vertical' | 'horizontal' = 'vertical'
   ): Promise<ClipRecord> => {
-    const res = await fetch(`/api/clips/${clipId}/compile?variant=${variant}`, { method: 'POST' });
+    const res = await fetch(apiUrl(`/api/clips/${clipId}/compile?variant=${variant}`), { method: 'POST' });
     const data = await readJsonResponse<ClipRecord>(res);
     await fetchWorkspace();
     return data;
   };
 
   const handleRescoreClip = async (clipId: number, useAi: boolean): Promise<ClipRecord> => {
-    const res = await fetch(`/api/clips/${clipId}/rescore`, {
+    const res = await fetch(apiUrl(`/api/clips/${clipId}/rescore`), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ useAi }),
@@ -223,7 +224,7 @@ export function App() {
     startTime: number,
     endTime: number
   ): Promise<ClipRecord> => {
-    const res = await fetch('/api/clips', {
+    const res = await fetch(apiUrl('/api/clips'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ videoId, startTime, endTime }),
@@ -234,7 +235,7 @@ export function App() {
   };
 
   const handleDeleteClip = async (clipId: number) => {
-    await fetch(`/api/clips/${clipId}`, { method: 'DELETE' });
+    await fetch(apiUrl(`/api/clips/${clipId}`), { method: 'DELETE' });
     if (selectedClipId === clipId) {
       setSelectedClipId(null);
     }
@@ -242,7 +243,7 @@ export function App() {
   };
 
   const handleSaveTranscript = async (videoId: number, segments: TranscriptSegment[]) => {
-    const res = await fetch(`/api/transcriptions/${videoId}`, {
+    const res = await fetch(apiUrl(`/api/transcriptions/${videoId}`), {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ segments }),
@@ -257,7 +258,7 @@ export function App() {
   ): Promise<{ importedCount: number }> => {
     const form = new FormData();
     form.append('srt', file);
-    const res = await fetch(`/api/transcriptions/${videoId}/import-srt`, {
+    const res = await fetch(apiUrl(`/api/transcriptions/${videoId}/import-srt`), {
       method: 'POST',
       body: form,
     });
@@ -270,7 +271,7 @@ export function App() {
   };
 
   const handleCreateProject = async (name: string) => {
-    await fetch('/api/projects', {
+    await fetch(apiUrl('/api/projects'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name }),
@@ -279,7 +280,7 @@ export function App() {
   };
 
   const handleSaveScoringConfig = async (next: ScoringConfig) => {
-    await fetch('/api/scoring-config', {
+    await fetch(apiUrl('/api/scoring-config'), {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(next),
@@ -288,7 +289,7 @@ export function App() {
   };
 
   const handleCleanupStorage = async () => {
-    const res = await fetch('/api/storage/cleanup', { method: 'POST' });
+    const res = await fetch(apiUrl('/api/storage/cleanup'), { method: 'POST' });
     const result = await readJsonResponse<{
       removedFiles: number;
       removedBytes: number;
