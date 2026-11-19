@@ -411,7 +411,7 @@ export async function renderClipWithFfmpeg(params: {
     overlaySpecs.forEach((overlay, index) => {
       const output = `overlay${index}`;
       chains.push(
-        `[${previous}][${index + 1}:v]overlay=0:0:enable='between(t,${overlay.start.toFixed(3)},${overlay.end.toFixed(3)})'[${output}]`
+        `[${previous}][${index + 1}:v]overlay=0:0:shortest=1:enable='between(t,${overlay.start.toFixed(3)},${overlay.end.toFixed(3)})'[${output}]`
       );
       previous = output;
     });
@@ -444,10 +444,15 @@ export async function renderClipWithFfmpeg(params: {
     args.push('-an');
   }
 
+  if (overlaySpecs.length > 0) args.push('-shortest');
+
   args.push(mp4Path);
 
   try {
     await execFileAsync('ffmpeg', args, { timeout: 120000 });
+  } catch (error) {
+    safeDeleteFile(mp4Path);
+    throw error;
   } finally {
     // Always remove the temporary burn-in file, including failed renders.
     if (fs.existsSync(assPath)) fs.unlinkSync(assPath);
@@ -465,4 +470,12 @@ export async function renderClipWithFfmpeg(params: {
     thumbnailUrl,
     exportedSizeBytes: stat.size,
   };
+}
+
+function safeDeleteFile(filePath: string): void {
+  try {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch {
+    // Best-effort cleanup; the original render error is more useful to callers.
+  }
 }
