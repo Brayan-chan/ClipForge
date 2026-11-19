@@ -312,12 +312,12 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
     width: 84,
     height: 20,
   };
-  const isSubtitleEditing = Boolean(
-    previewSource === 'live' &&
+  const isSubtitleWorkspace = Boolean(
     compositionView === 'edit' &&
     inspectorTab === 'subtitles' &&
     draft?.subtitleStyle.enabled
   );
+  const isSubtitleEditing = previewSource === 'live' && isSubtitleWorkspace;
 
   const resolvedVideoSrc = useMemo(() => {
     if (previewSource === 'compiled') {
@@ -1273,7 +1273,9 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                 {previewSource === 'live' && (
                   <div className="sticky top-0 z-30 flex w-full shrink-0 items-center justify-between gap-3 border-b border-white/10 bg-slate-950/95 pb-3 text-[11px] text-slate-300 backdrop-blur">
                     <span>
-                      {compositionView === 'edit'
+                      {isSubtitleEditing
+                        ? 'Arrastra y redimensiona el cuadro de subtítulos directamente sobre el video.'
+                        : compositionView === 'edit'
                         ? 'Arrastra las cajas sobre el video original. Usa la esquina para cambiar su tamaño.'
                         : 'Previsualización final con encuadre y subtítulos.'}
                     </span>
@@ -1307,13 +1309,13 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                           </button>
                         ))}
                       </div>
-                      {compositionView === 'edit' && activeComposition?.cameraEnabled && (
+                      {!isSubtitleEditing && compositionView === 'edit' && activeComposition?.cameraEnabled && (
                         <button type="button" onClick={() => updateComposition({ cameraEnabled: false, layout: 'focus', focus: 'content' })}
                           className="rounded-md border border-red-400/50 px-2.5 py-1 font-semibold text-red-300 hover:bg-red-400/10">
                           Eliminar cámara
                         </button>
                       )}
-                      {compositionView === 'edit' && (
+                      {!isSubtitleEditing && compositionView === 'edit' && (
                         <button
                           type="button"
                           onClick={handleAutoDetectCamera}
@@ -1340,6 +1342,9 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                 <div className={`grid w-full shrink-0 items-center gap-4 ${previewSource === 'live' && compositionView === 'edit' && !isSubtitleEditing ? 'lg:grid-cols-[minmax(0,1fr)_210px]' : 'place-items-center'}`}>
                 <div
                   data-focus-canvas
+                  style={isSubtitleWorkspace && previewSource === 'compiled'
+                    ? { maxWidth: activeVariant === 'vertical' ? 230 : 680 }
+                    : undefined}
                   className={`relative overflow-hidden rounded-lg border border-white/15 bg-black shadow-2xl ${
                     (previewSource === 'live' && compositionView === 'preview') || isSubtitleEditing
                       ? 'absolute h-px w-px overflow-hidden opacity-0 pointer-events-none'
@@ -1420,8 +1425,8 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                       </div>
                     </div>
                   )}
-
                 </div>
+                {/* Preview Result */}
                 {previewSource === 'live' && (
                   <div className={`flex flex-col items-center gap-2 ${
                     compositionView === 'preview'
@@ -1431,11 +1436,15 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                     <div className="text-center text-[11px] font-semibold text-slate-200">
                       Resultado {activeVariant === 'vertical' ? 'vertical 9:16' : 'horizontal 16:9'}
                     </div>
-                    <div data-focus-canvas className={`relative w-full overflow-hidden rounded-lg ${
+                    <div
+                      data-focus-canvas
+                      className={`relative w-full overflow-hidden rounded-lg ${
                       compositionView === 'preview'
                         ? 'max-h-[500px] max-w-[720px]'
                         : isSubtitleEditing
-                        ? activeVariant === 'vertical' ? 'max-h-[650px] max-w-[366px]' : 'max-w-[1000px]'
+                        ? activeVariant === 'vertical'
+                          ? 'max-h-[302px] max-w-[170px]'
+                          : 'max-w-[520px]'
                         : 'max-h-[390px]'
                     } ${activeVariant === 'vertical' ? 'aspect-[9/16]' : 'aspect-video'}`}>
                       <canvas
@@ -1654,7 +1663,16 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                 <button
                   key={tab}
                   type="button"
-                  onClick={() => setInspectorTab(tab)}
+                  onClick={() => {
+                    setInspectorTab(tab);
+                    if (tab === 'subtitles') {
+                      // Subtitle positioning must happen on the editable
+                      // composition canvas, not on the large compiled player.
+                      setPreviewSource('live');
+                      setCompositionView('edit');
+                      setCurrentTime(draft?.startTime ?? 0);
+                    }
+                  }}
                   className={`rounded-md py-1.5 text-xs font-medium transition-colors ${
                     inspectorTab === tab
                       ? 'bg-white text-slate-900 shadow-sm dark:bg-[#252A36] dark:text-white'

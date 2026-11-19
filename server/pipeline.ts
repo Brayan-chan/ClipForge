@@ -21,7 +21,6 @@ import {
   refineCandidatesWithGemini,
   transcribeAudioWithGemini,
 } from './processing/geminiClient';
-import { renderClipWithFfmpeg } from './processing/renderer';
 import { analyzeAudioEvents } from './processing/momentDetection/audioEvents';
 import { detectNarrativeMoments } from './processing/momentDetection/momentDetector';
 import {
@@ -202,7 +201,10 @@ export async function runVideoPipeline(params: {
         }
       }
 
-      // Stage 5: Generate per-clip preview thumbnails & render real playable MP4 clips
+      // Stage 5: Generate lightweight preview thumbnails. Final MP4 rendering
+      // is intentionally deferred until the user selects "Compile & Export"
+      // in Clip Studio. Rendering every candidate here made local processing
+      // several minutes slower and produced files the user might never use.
       await updateJob(jobId, 'generating_thumbnails', 86, 'Generating clip thumbnails & preparing cuts...');
 
       const thumbUrls: Array<string | null> = [];
@@ -262,44 +264,6 @@ export async function runVideoPipeline(params: {
         }
       });
 
-      let renderedCount = 0;
-      for (let i = 0; i < createdClips.length; i++) {
-        const clip = createdClips[i];
-        const pct = 88 + Math.round(((i + 0.5) / Math.max(1, createdClips.length)) * 11);
-        await updateJob(
-          jobId,
-          'generating_thumbnails',
-          pct,
-          `Cutting & rendering real MP4 clip ${i + 1}/${createdClips.length}...`
-        );
-        try {
-          const rendered = await renderClipWithFfmpeg({
-            clip,
-            videoPath,
-            hasAudio: meta.hasAudio,
-            segments,
-            variant: 'vertical',
-          });
-          renderedCount++;
-          await mutateDb((db) => {
-            const target = db.clips.find((c) => c.id === clip.id);
-            if (target) {
-              target.exportedUrl = rendered.exportedUrl;
-              target.srtUrl = rendered.srtUrl;
-              target.exportedSizeBytes = rendered.exportedSizeBytes;
-              target.exportVariants = { vertical: rendered };
-              if (rendered.thumbnailUrl) target.thumbnailUrl = rendered.thumbnailUrl;
-              target.status = i === 0 ? 'approved' : 'exported';
-            }
-          });
-        } catch (renderErr) {
-          console.warn(
-            `[ClipForge] Failed auto-rendering clip ${clip.id}:`,
-            renderErr instanceof Error ? renderErr.message : renderErr
-          );
-        }
-      }
-
       await mutateDb((db) => {
         const finalVideo = db.videos.find((v) => v.id === videoId);
         if (finalVideo) {
@@ -312,7 +276,7 @@ export async function runVideoPipeline(params: {
         jobId,
         'completed',
         100,
-        `Pipeline complete: ${renderedCount}/${createdClips.length} real MP4 clips created & ready.${fallbackNote}`
+        `Pipeline complete: ${createdClips.length} clip candidates ready. Open Clip Studio to preview and compile only the versions you want.${fallbackNote}`
       );
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unexpected processing error';
