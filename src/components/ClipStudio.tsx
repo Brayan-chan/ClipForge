@@ -312,6 +312,12 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
     width: 84,
     height: 20,
   };
+  const isSubtitleEditing = Boolean(
+    previewSource === 'live' &&
+    compositionView === 'edit' &&
+    inspectorTab === 'subtitles' &&
+    draft?.subtitleStyle.enabled
+  );
 
   const resolvedVideoSrc = useMemo(() => {
     if (previewSource === 'compiled') {
@@ -661,17 +667,20 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
       ctx.textBaseline = 'middle';
       const maxWidth = width * (region.width / 100) * 0.92;
       const words = text.split(/\s+/);
-      const lines: string[] = [];
-      let line = '';
-      for (const word of words) {
-        const candidate = line ? `${line} ${word}` : word;
-        if (ctx.measureText(candidate).width > maxWidth && line) {
+      const lines: Array<Array<{ text: string; index: number }>> = [];
+      let line: Array<{ text: string; index: number }> = [];
+      words.forEach((word, index) => {
+        const candidate = [...line, { text: word, index }];
+        if (ctx.measureText(candidate.map((item) => item.text).join(' ')).width > maxWidth && line.length) {
           lines.push(line);
-          line = word;
+          line = [{ text: word, index }];
         } else line = candidate;
-      }
-      if (line) lines.push(line);
+      });
+      if (line.length) lines.push(line);
       const visibleLines = lines.slice(0, 3);
+      const segmentDuration = Math.max(0.1, frameSegment.end - frameSegment.start);
+      const segmentProgress = Math.min(0.999, Math.max(0, (frameTime - frameSegment.start) / segmentDuration));
+      const activeWordIndex = Math.min(words.length - 1, Math.floor(segmentProgress * words.length));
       const blockHeight = Math.min(
         height * (region.height / 100),
         visibleLines.length * fontSize * 1.2 + 20
@@ -687,14 +696,24 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
           blockHeight
         );
       }
-      ctx.fillStyle = draft.subtitleStyle.textColor;
       ctx.strokeStyle = '#000';
       ctx.lineWidth = 5;
+      ctx.textAlign = 'left';
       visibleLines.forEach((value, index) => {
         const y = centerY + (index - (visibleLines.length - 1) / 2) * fontSize * 1.2;
-        ctx.strokeText(value, centerX, y, maxWidth);
-        ctx.fillText(value, centerX, y, maxWidth);
+        const lineWidth = ctx.measureText(value.map((item) => item.text).join(' ')).width;
+        let x = centerX - lineWidth / 2;
+        value.forEach((item, wordPosition) => {
+          const rendered = `${item.text}${wordPosition < value.length - 1 ? ' ' : ''}`;
+          ctx.strokeText(rendered, x, y);
+          ctx.fillStyle = item.index === activeWordIndex
+            ? draft.subtitleStyle.highlightColor
+            : draft.subtitleStyle.textColor;
+          ctx.fillText(rendered, x, y);
+          x += ctx.measureText(rendered).width;
+        });
       });
+      ctx.textAlign = 'center';
     }
     };
 
@@ -1318,11 +1337,11 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                     </div>
                   </div>
                 )}
-                <div className={`grid w-full shrink-0 items-center gap-4 ${previewSource === 'live' && compositionView === 'edit' ? 'lg:grid-cols-[minmax(0,1fr)_210px]' : 'place-items-center'}`}>
+                <div className={`grid w-full shrink-0 items-center gap-4 ${previewSource === 'live' && compositionView === 'edit' && !isSubtitleEditing ? 'lg:grid-cols-[minmax(0,1fr)_210px]' : 'place-items-center'}`}>
                 <div
                   data-focus-canvas
                   className={`relative overflow-hidden rounded-lg border border-white/15 bg-black shadow-2xl ${
-                    previewSource === 'live' && compositionView === 'preview'
+                    (previewSource === 'live' && compositionView === 'preview') || isSubtitleEditing
                       ? 'absolute h-px w-px overflow-hidden opacity-0 pointer-events-none'
                       : previewSource === 'live'
                       ? 'aspect-video w-full'
@@ -1412,8 +1431,12 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                     <div className="text-center text-[11px] font-semibold text-slate-200">
                       Resultado {activeVariant === 'vertical' ? 'vertical 9:16' : 'horizontal 16:9'}
                     </div>
-                    <div className={`relative w-full overflow-hidden rounded-lg ${
-                      compositionView === 'preview' ? 'max-h-[500px] max-w-[720px]' : 'max-h-[390px]'
+                    <div data-focus-canvas className={`relative w-full overflow-hidden rounded-lg ${
+                      compositionView === 'preview'
+                        ? 'max-h-[500px] max-w-[720px]'
+                        : isSubtitleEditing
+                        ? activeVariant === 'vertical' ? 'max-h-[650px] max-w-[366px]' : 'max-w-[1000px]'
+                        : 'max-h-[390px]'
                     } ${activeVariant === 'vertical' ? 'aspect-[9/16]' : 'aspect-video'}`}>
                       <canvas
                         ref={compositionCanvasRef}
@@ -1830,6 +1853,29 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                     </button>
                   ))}
                 </div>
+
+                {draft.subtitleStyle.enabled && (
+                  <label className="flex items-center justify-between rounded-lg border border-slate-200 px-3 py-2.5 text-xs text-slate-600 dark:border-white/10 dark:text-slate-300">
+                    <span>
+                      <span className="block font-semibold text-slate-900 dark:text-white">{t.wordHighlight}</span>
+                      <span className="mt-0.5 block text-[11px] opacity-70">{t.wordHighlightHint}</span>
+                    </span>
+                    <input
+                      type="color"
+                      value={draft.subtitleStyle.highlightColor}
+                      onChange={(event) =>
+                        updateDraftLive({
+                          ...draft,
+                          subtitleStyle: {
+                            ...draft.subtitleStyle,
+                            highlightColor: event.target.value,
+                          },
+                        })
+                      }
+                      className="h-9 w-11 cursor-pointer rounded-md border border-slate-200 bg-transparent p-1 dark:border-white/15"
+                    />
+                  </label>
+                )}
 
                 {draft.subtitleStyle.enabled && (
                   <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-3 text-xs leading-relaxed text-emerald-800 dark:text-emerald-200">

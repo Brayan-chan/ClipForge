@@ -132,12 +132,33 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 `;
 
   const subtitleEvents = clipSegments
-    .map((seg) => {
+    .flatMap((seg) => {
       const cleanText = seg.text
         .replace(/\\/g, '')
         .replace(/\{|\}/g, '')
-        .replace(/\r?\n/g, '\\N');
-      return `Dialogue: 0,${formatAssTime(seg.start)},${formatAssTime(seg.end)},Default,,0,0,0,,${cleanText}`;
+        .replace(/\r?\n/g, ' ')
+        .trim();
+      const words = cleanText.split(/\s+/).filter(Boolean);
+      if (words.length === 0) return [];
+      const wordDuration = Math.max(0.04, (seg.end - seg.start) / words.length);
+      const region = style.region;
+      const regionOverride = region
+        ? `{\\an5\\pos(${Math.round(width * ((region.x + region.width / 2) / 100))},${Math.round(height * ((region.y + region.height / 2) / 100))})\\clip(${Math.round(width * region.x / 100)},${Math.round(height * region.y / 100)},${Math.round(width * (region.x + region.width) / 100)},${Math.round(height * (region.y + region.height) / 100)})}`
+        : '';
+      return words.map((_, activeIndex) => {
+        const start = seg.start + activeIndex * wordDuration;
+        const end = activeIndex === words.length - 1
+          ? seg.end
+          : Math.min(seg.end, start + wordDuration);
+        const highlightedText = words
+          .map((word, index) =>
+            index === activeIndex
+              ? `{\\1c${secondaryColor}}${word}{\\1c${primaryColor}}`
+              : word
+          )
+          .join(' ');
+        return `Dialogue: 0,${formatAssTime(start)},${formatAssTime(end)},Default,,0,0,0,,${regionOverride}${highlightedText}`;
+      });
     })
     .join('\n');
 
@@ -161,8 +182,9 @@ function writeTextOverlayPng(params: {
   text: string;
   style: SubtitleStyle;
   credit?: boolean;
+  highlightWordIndex?: number;
 }): void {
-  const { filePath, width, height, text, style, credit = false } = params;
+  const { filePath, width, height, text, style, credit = false, highlightWordIndex } = params;
   const canvas = createCanvas(width, height);
   const ctx = canvas.getContext('2d');
   const fontSize = credit
@@ -186,16 +208,16 @@ function writeTextOverlayPng(params: {
   };
   const maxWidth = credit ? width * 0.88 : width * (region.width / 100) * 0.92;
   const words = text.trim().split(/\s+/);
-  const lines: string[] = [];
-  let line = '';
-  for (const word of words) {
-    const candidate = line ? `${line} ${word}` : word;
-    if (ctx.measureText(candidate).width > maxWidth && line) {
+  const lines: Array<Array<{ text: string; index: number }>> = [];
+  let line: Array<{ text: string; index: number }> = [];
+  words.forEach((word, index) => {
+    const candidate = [...line, { text: word, index }];
+    if (ctx.measureText(candidate.map((item) => item.text).join(' ')).width > maxWidth && line.length) {
       lines.push(line);
-      line = word;
+      line = [{ text: word, index }];
     } else line = candidate;
-  }
-  if (line) lines.push(line);
+  });
+  if (line.length) lines.push(line);
   const visibleLines = credit ? lines.slice(0, 1) : lines.slice(0, 3);
   const lineHeight = fontSize * 1.2;
   const blockHeight = credit
@@ -224,11 +246,27 @@ function writeTextOverlayPng(params: {
   ctx.lineJoin = 'round';
   ctx.lineWidth = Math.max(3, Math.round(fontSize * 0.12));
   ctx.strokeStyle = '#000000';
-  ctx.fillStyle = credit ? '#FFFFFF' : style.textColor;
+  ctx.textAlign = 'left';
   visibleLines.forEach((value, index) => {
     const y = centerY + (index - (visibleLines.length - 1) / 2) * lineHeight;
-    ctx.strokeText(value, anchorX, y, maxWidth);
-    ctx.fillText(value, anchorX, y, maxWidth);
+    const lineText = value.map((item) => item.text).join(' ');
+    const lineWidth = ctx.measureText(lineText).width;
+    let x = credit || style.alignment === 'left'
+      ? anchorX
+      : style.alignment === 'right'
+      ? anchorX - lineWidth
+      : anchorX - lineWidth / 2;
+    value.forEach((item, wordPosition) => {
+      const rendered = `${item.text}${wordPosition < value.length - 1 ? ' ' : ''}`;
+      ctx.strokeText(rendered, x, y);
+      ctx.fillStyle = credit
+        ? '#FFFFFF'
+        : item.index === highlightWordIndex
+        ? style.highlightColor
+        : style.textColor;
+      ctx.fillText(rendered, x, y);
+      x += ctx.measureText(rendered).width;
+    });
   });
   fs.writeFileSync(filePath, canvas.toBuffer('image/png'));
 }
@@ -346,7 +384,6 @@ export async function renderClipWithFfmpeg(params: {
   const shouldBurnCredit = Boolean(composition?.creditEnabled && composition.creditText.trim());
   const canBurnAss =
     (shouldBurnSubtitles || shouldBurnCredit) &&
-    !clip.subtitleStyle.region &&
     await supportsAssFilter();
   const overlaySpecs: Array<{ path: string; start: number; end: number }> = [];
   if (canBurnAss) {
@@ -368,16 +405,28 @@ export async function renderClipWithFfmpeg(params: {
     // Portable fallback for FFmpeg builds without libass: render transparent
     // subtitle cards as PNGs and time them with the standard overlay filter.
     if (shouldBurnSubtitles) {
-      clipSegments.forEach((segment, index) => {
-        const overlayPath = path.join(CLIPS_DIR, `clip-${clip.id}-${stamp}-sub-${index}.png`);
-        writeTextOverlayPng({
-          filePath: overlayPath,
-          width,
-          height,
-          text: segment.text,
-          style: clip.subtitleStyle,
+      clipSegments.forEach((segment, segmentIndex) => {
+        const words = segment.text.trim().split(/\s+/).filter(Boolean);
+        const wordDuration = Math.max(0.04, (segment.end - segment.start) / Math.max(1, words.length));
+        words.forEach((_, wordIndex) => {
+          const overlayPath = path.join(
+            CLIPS_DIR,
+            `clip-${clip.id}-${stamp}-sub-${segmentIndex}-${wordIndex}.png`
+          );
+          writeTextOverlayPng({
+            filePath: overlayPath,
+            width,
+            height,
+            text: segment.text,
+            style: clip.subtitleStyle,
+            highlightWordIndex: wordIndex,
+          });
+          const start = segment.start + wordIndex * wordDuration;
+          const end = wordIndex === words.length - 1
+            ? segment.end
+            : Math.min(segment.end, start + wordDuration);
+          overlaySpecs.push({ path: overlayPath, start, end });
         });
-        overlaySpecs.push({ path: overlayPath, start: segment.start, end: segment.end });
       });
     }
     if (shouldBurnCredit && composition) {
