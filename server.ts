@@ -41,9 +41,17 @@ import {
   generateDemoPodcastVideo,
 } from './server/processing/sampleGenerator';
 import {
+  abortMultipartObjectUpload,
   buildReadableObjectUrl,
+  completeMultipartObjectUpload,
+  createMultipartObjectUpload,
+  createMultipartPartUrl,
+  deleteObjectStorageKeys,
+  downloadObjectStorageKeyToTemp,
   createPresignedObjectUrl,
   isObjectStorageConfigured,
+  objectKeyFromUrl,
+  uploadLocalFileToObjectStorage,
 } from './server/processing/objectStorage';
 import {
   UrlIngestionError,
@@ -65,6 +73,22 @@ import {
   checkFfmpegBinaries,
   generateThumbnail,
 } from './server/processing/videoAnalyzer';
+import {
+  clipSubtitleDocumentId,
+  deleteSubtitleText,
+  isFirestoreSubtitlesConfigured,
+  readSubtitleText,
+} from './server/processing/firestoreSubtitles';
+import {
+  deleteCloudinaryImage,
+  isCloudinaryConfigured,
+} from './server/processing/cloudinaryImages';
+
+try {
+  process.loadEnvFile?.();
+} catch {
+  // Environment variables may already be supplied by the shell/host.
+}
 
 ensureStorageDirs();
 const recoveredCount = recoverInterruptedJobs();
@@ -84,6 +108,40 @@ app.use('/storage', (_req, res) => {
   res.status(404).json({ error: 'Not found' });
 });
 
+app.get(/^\/api\/media\/(.+)$/, (req, res) => {
+  if (!isObjectStorageConfigured()) {
+    res.status(503).json({ error: 'R2 object storage is not configured.' });
+    return;
+  }
+  const rawKey = String(req.params[0] ?? '');
+  let key = '';
+  try {
+    key = rawKey.split('/').map((part) => decodeURIComponent(part)).join('/');
+  } catch {
+    res.status(400).json({ error: 'Invalid media key.' });
+    return;
+  }
+  if (!/^(uploads|clips|subtitles|thumbnails)\//.test(key) || key.includes('..')) {
+    res.status(400).json({ error: 'Invalid media key.' });
+    return;
+  }
+  res.redirect(307, buildReadableObjectUrl(key));
+});
+
+app.get('/api/subtitles/:documentId', async (req, res) => {
+  const documentId = req.params.documentId;
+  if (!/^clip-\d+-(vertical|horizontal)$/.test(documentId)) {
+    res.status(400).json({ error: 'Invalid subtitle document.' });
+    return;
+  }
+  const srt = await readSubtitleText(documentId);
+  if (srt === null) {
+    res.status(404).json({ error: 'Subtitle document not found.' });
+    return;
+  }
+  res.type('application/x-subrip; charset=utf-8').send(srt);
+});
+
 function removeClipArtifactsByIds(clipIds: Iterable<number>): number {
   const ids = new Set(clipIds);
   if (ids.size === 0) return 0;
@@ -96,6 +154,15 @@ function removeClipArtifactsByIds(clipIds: Iterable<number>): number {
       safeUnlink(path.join(dir, filename));
       removed++;
     }
+  }
+  return removed;
+}
+
+async function deleteCloudinaryKeys(keys: Iterable<string>): Promise<number> {
+  if (!isCloudinaryConfigured()) return 0;
+  let removed = 0;
+  for (const key of new Set(keys)) {
+    if (key.startsWith('clipforge/') && await deleteCloudinaryImage(key)) removed++;
   }
   return removed;
 }
@@ -239,6 +306,13 @@ const srtUpload = multer({
 
 const CHUNKS_DIR = path.join(STORAGE_ROOT, '.chunks');
 const UPLOAD_CHUNK_BYTES = 5 * 1024 * 1024; // 5 MB chunks stay safely under proxy limits
+const DEFAULT_CLIP_COUNT = 5;
+
+function normalizeClipCount(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return DEFAULT_CLIP_COUNT;
+  return Math.max(1, Math.min(10, Math.round(parsed)));
+}
 
 interface ChunkUploadSession {
   uploadId: string;
@@ -251,6 +325,8 @@ interface ChunkUploadSession {
   title: string;
   projectId: number;
   useAi: boolean;
+  editorOnly: boolean;
+  requestedClipCount: number;
   transcriptText: string;
   createdAtMs: number;
   lastActivityMs: number;
@@ -277,7 +353,11 @@ async function finalizeUploadedVideo(params: {
   title: string;
   projectId: number;
   useAi: boolean;
+  editorOnly: boolean;
+  requestedClipCount: number;
   transcriptText: string;
+  presetSegments?: TranscriptSegment[];
+  transcriptSource?: 'gemini' | 'srt' | 'manual' | 'sample';
 }) {
   let videoMeta;
   try {
@@ -291,6 +371,24 @@ async function finalizeUploadedVideo(params: {
     throw err;
   }
 
+  let storageKey: string | undefined;
+  let remoteFileUrl: string | undefined;
+  if (isObjectStorageConfigured()) {
+    storageKey = `uploads/${params.filename}`;
+    const extension = path.extname(params.filename).toLowerCase();
+    const contentType = extension === '.webm'
+      ? 'video/webm'
+      : extension === '.mov'
+      ? 'video/quicktime'
+      : 'video/mp4';
+    remoteFileUrl = await uploadLocalFileToObjectStorage({
+      filePath: params.filePath,
+      key: storageKey,
+      contentType,
+    });
+    safeUnlink(params.filePath);
+  }
+
   const { video, job } = await mutateDb((db) => {
     const videoId = db.nextIds.video++;
     const v = {
@@ -299,7 +397,9 @@ async function finalizeUploadedVideo(params: {
       title: params.title,
       filename: params.filename,
       originalName: path.basename(params.originalName),
-      fileUrl: `/storage/uploads/${params.filename}`,
+      fileUrl: remoteFileUrl ?? `/storage/uploads/${params.filename}`,
+      sourceUrl: storageKey ? `r2://${storageKey}` : undefined,
+      storageKey,
       thumbnailUrl: null as string | null,
       duration: videoMeta.duration,
       width: videoMeta.width,
@@ -321,6 +421,8 @@ async function finalizeUploadedVideo(params: {
       progress: 10,
       message: 'Video validated & queued for sequential processing...',
       useAi: params.useAi,
+      editorOnly: params.editorOnly,
+      requestedClipCount: params.requestedClipCount,
       updatedAt: new Date().toISOString(),
     };
     db.processingJobs.push(j);
@@ -331,7 +433,11 @@ async function finalizeUploadedVideo(params: {
     videoId: video.id,
     jobId: job.id,
     useAi: params.useAi,
+    editorOnly: params.editorOnly,
+    requestedClipCount: params.requestedClipCount,
     suppliedTranscript: params.transcriptText,
+    presetSegments: params.presetSegments,
+    transcriptSource: params.transcriptSource,
   });
 
   return { video, job };
@@ -351,6 +457,8 @@ app.get('/api/status', async (_req, res) => {
     geminiConfigured: isGeminiConfigured(),
     maxUploadSizeBytes: MAX_VIDEO_SIZE_BYTES,
     objectStorageConfigured: isObjectStorageConfigured(),
+    firestoreSubtitlesConfigured: isFirestoreSubtitlesConfigured(),
+    cloudinaryConfigured: isCloudinaryConfigured(),
     storageBytes: getStorageUsageBytes(),
     activeQueueTasks: queueStats.active,
     queuedTasks: queueStats.queued,
@@ -401,6 +509,7 @@ app.post('/api/videos/demo', async (req, res) => {
   try {
     // Gemini disabled by default
     const useAi = req.body?.useAi === true;
+    const requestedClipCount = normalizeClipCount(req.body?.requestedClipCount);
     const projectId = Number(req.body?.projectId) || 1;
     const demo = await processingQueue.run(() => generateDemoPodcastVideo());
     const meta = await analyzeVideo(demo.filePath);
@@ -435,6 +544,7 @@ app.post('/api/videos/demo', async (req, res) => {
         progress: 8,
         message: 'Queued demo podcast video for deterministic clipping...',
         useAi,
+        requestedClipCount,
         updatedAt: new Date().toISOString(),
       };
       db.processingJobs.push(j);
@@ -457,6 +567,7 @@ app.post('/api/videos/demo', async (req, res) => {
       videoId: video.id,
       jobId: job.id,
       useAi,
+      requestedClipCount,
       presetSegments: SAMPLE_PODCAST_SEGMENTS,
       transcriptSource: 'sample',
     });
@@ -487,6 +598,8 @@ app.post('/api/videos/upload', upload.single('video'), async (req, res) => {
       req.file.originalname.replace(/\.[^.]+$/, '');
     const projectId = Number(req.body.projectId) || 1;
     const useAi = req.body.useAi === 'true' || req.body.useAi === true;
+    const editorOnly = req.body.editorOnly === 'true' || req.body.editorOnly === true;
+    const requestedClipCount = normalizeClipCount(req.body.requestedClipCount);
     const transcriptText = (req.body.transcriptText as string | undefined) ?? '';
 
     const result = await finalizeUploadedVideo({
@@ -497,6 +610,8 @@ app.post('/api/videos/upload', upload.single('video'), async (req, res) => {
       title,
       projectId,
       useAi,
+      editorOnly,
+      requestedClipCount,
       transcriptText,
     });
 
@@ -518,6 +633,8 @@ app.post('/api/videos/upload/init', (req, res) => {
     title,
     projectId,
     useAi = false,
+    editorOnly = false,
+    requestedClipCount = DEFAULT_CLIP_COUNT,
     transcriptText = '',
   } = req.body as {
     filename?: string;
@@ -526,6 +643,8 @@ app.post('/api/videos/upload/init', (req, res) => {
     title?: string;
     projectId?: number;
     useAi?: boolean;
+    editorOnly?: boolean;
+    requestedClipCount?: number;
     transcriptText?: string;
   };
 
@@ -575,6 +694,8 @@ app.post('/api/videos/upload/init', (req, res) => {
       path.basename(filename).replace(/\.[^.]+$/, ''),
     projectId: Number(projectId) || 1,
     useAi: useAi === true,
+    editorOnly: editorOnly === true,
+    requestedClipCount: normalizeClipCount(requestedClipCount),
     transcriptText: typeof transcriptText === 'string' ? transcriptText : '',
     createdAtMs: now,
     lastActivityMs: now,
@@ -697,6 +818,8 @@ app.post('/api/videos/upload/complete/:uploadId', async (req, res) => {
       title: session.title,
       projectId: session.projectId,
       useAi: session.useAi,
+      editorOnly: session.editorOnly,
+      requestedClipCount: session.requestedClipCount,
       transcriptText: session.transcriptText,
     });
     res.status(201).json(result);
@@ -759,12 +882,109 @@ app.post('/api/uploads/presign', (req, res) => {
   res.status(201).json({ key, putUrl });
 });
 
+const MULTIPART_PART_SIZE_BYTES = 64 * 1024 * 1024;
+
+function isSafeUploadKey(key: unknown): key is string {
+  return typeof key === 'string' && key.startsWith('uploads/') && !key.includes('..');
+}
+
+app.post('/api/uploads/multipart/init', async (req, res) => {
+  if (!isObjectStorageConfigured()) {
+    res.status(501).json({ error: 'Object storage (S3/R2) is not configured.' });
+    return;
+  }
+  try {
+    const { filename, mimetype = 'video/mp4', sizeBytes } = req.body as {
+      filename?: string;
+      mimetype?: string;
+      sizeBytes?: number;
+    };
+    if (!filename || typeof sizeBytes !== 'number' || sizeBytes <= 0) {
+      res.status(400).json({ error: 'Invalid upload metadata.' });
+      return;
+    }
+    const check = validateUploadedFileMeta({ originalname: filename, mimetype, size: sizeBytes });
+    if (!check.valid) {
+      res.status(400).json({ error: check.error });
+      return;
+    }
+    const key = `uploads/${generateSafeMediaFilename(filename)}`;
+    const uploadId = await createMultipartObjectUpload({ key, contentType: mimetype });
+    res.status(201).json({ key, uploadId, partSizeBytes: MULTIPART_PART_SIZE_BYTES });
+  } catch (err) {
+    console.error('[r2] Could not initialize multipart upload:', err);
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Could not initialize upload.' });
+  }
+});
+
+app.post('/api/uploads/multipart/part-url', async (req, res) => {
+  try {
+    const { key, uploadId, partNumber } = req.body as {
+      key?: string;
+      uploadId?: string;
+      partNumber?: number;
+    };
+    if (!isSafeUploadKey(key) || !uploadId || !Number.isInteger(partNumber) || partNumber! < 1 || partNumber! > 10_000) {
+      res.status(400).json({ error: 'Invalid multipart upload part.' });
+      return;
+    }
+    const putUrl = await createMultipartPartUrl({ key, uploadId, partNumber: partNumber! });
+    res.json({ putUrl });
+  } catch (err) {
+    console.error('[r2] Could not sign multipart part:', err);
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Could not sign upload part.' });
+  }
+});
+
+app.post('/api/uploads/multipart/complete', async (req, res) => {
+  try {
+    const { key, uploadId, parts } = req.body as {
+      key?: string;
+      uploadId?: string;
+      parts?: Array<{ partNumber?: number; etag?: string }>;
+    };
+    const validParts = Array.isArray(parts) && parts.length > 0 && parts.every((part) =>
+      Number.isInteger(part.partNumber) && part.partNumber! >= 1 && part.partNumber! <= 10_000 &&
+      typeof part.etag === 'string' && part.etag.length > 0
+    );
+    if (!isSafeUploadKey(key) || !uploadId || !validParts) {
+      res.status(400).json({ error: 'Invalid multipart completion payload.' });
+      return;
+    }
+    await completeMultipartObjectUpload({
+      key,
+      uploadId,
+      parts: parts!.map((part) => ({ partNumber: part.partNumber!, etag: part.etag! })),
+    });
+    res.json({ key });
+  } catch (err) {
+    console.error('[r2] Could not complete multipart upload:', err);
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Could not complete upload.' });
+  }
+});
+
+app.post('/api/uploads/multipart/abort', async (req, res) => {
+  try {
+    const { key, uploadId } = req.body as { key?: string; uploadId?: string };
+    if (!isSafeUploadKey(key) || !uploadId) {
+      res.status(400).json({ error: 'Invalid multipart upload.' });
+      return;
+    }
+    await abortMultipartObjectUpload({ key, uploadId });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[r2] Could not abort multipart upload:', err);
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Could not abort upload.' });
+  }
+});
+
 app.post('/api/videos/from-storage', async (req, res) => {
   if (!isObjectStorageConfigured()) {
     res.status(501).json({ error: 'Object storage (S3/R2) is not configured.' });
     return;
   }
 
+  let temporaryInputPath: string | undefined;
   try {
     const {
       key,
@@ -773,6 +993,8 @@ app.post('/api/videos/from-storage', async (req, res) => {
       title,
       projectId = 1,
       useAi = false,
+      editorOnly = false,
+      requestedClipCount = DEFAULT_CLIP_COUNT,
       transcriptText = '',
     } = req.body as {
       key?: string;
@@ -781,6 +1003,8 @@ app.post('/api/videos/from-storage', async (req, res) => {
       title?: string;
       projectId?: number;
       useAi?: boolean;
+      editorOnly?: boolean;
+      requestedClipCount?: number;
       transcriptText?: string;
     };
 
@@ -789,10 +1013,19 @@ app.post('/api/videos/from-storage', async (req, res) => {
       return;
     }
 
-    const readUrl = buildReadableObjectUrl(key);
-    const probed = await probeRemoteDirectUrl(readUrl);
+    temporaryInputPath = await downloadObjectStorageKeyToTemp({
+      key,
+      extension: path.extname(originalName || key) || '.mp4',
+    });
+    const localMeta = await analyzeVideo(temporaryInputPath);
+    const probed = {
+      meta: localMeta,
+      sizeBytes: (await fs.promises.stat(temporaryInputPath)).size,
+      originalName: path.basename(originalName || key),
+    };
     const numericProjectId = Number(projectId) || 1;
     const aiEnabled = useAi === true;
+    const clipCount = normalizeClipCount(requestedClipCount);
     const cleanTranscript = typeof transcriptText === 'string' ? transcriptText.trim() : '';
     const resolvedName = path.basename(originalName || probed.originalName);
     const resolvedTitle =
@@ -808,8 +1041,9 @@ app.post('/api/videos/from-storage', async (req, res) => {
         title: resolvedTitle,
         filename: path.basename(key),
         originalName: resolvedName,
-        fileUrl: readUrl,
-        sourceUrl: readUrl,
+        fileUrl: `/api/media/${key.split('/').map(encodeURIComponent).join('/')}`,
+        sourceUrl: `r2://${key}`,
+        storageKey: key,
         sourceType: 'url' as const,
         thumbnailUrl: null as string | null,
         duration: probed.meta.duration,
@@ -832,6 +1066,8 @@ app.post('/api/videos/from-storage', async (req, res) => {
         progress: 10,
         message: 'Object storage video verified & queued (Audio-First + Fast Seek)...',
         useAi: aiEnabled,
+        editorOnly: editorOnly === true,
+        requestedClipCount: clipCount,
         updatedAt: new Date().toISOString(),
       };
       db.processingJobs.push(j);
@@ -839,7 +1075,7 @@ app.post('/api/videos/from-storage', async (req, res) => {
     });
 
     const thumbUrl = await generateThumbnail(
-      readUrl,
+      temporaryInputPath,
       `video-${video.id}-cover.jpg`,
       Math.min(2, Math.max(0.2, probed.meta.duration * 0.15))
     );
@@ -854,11 +1090,16 @@ app.post('/api/videos/from-storage', async (req, res) => {
       videoId: video.id,
       jobId: job.id,
       useAi: aiEnabled,
+      editorOnly: editorOnly === true,
+      requestedClipCount: clipCount,
       suppliedTranscript: cleanTranscript,
+      temporaryInputPath,
     });
+    temporaryInputPath = undefined;
 
     res.status(201).json({ video, job });
   } catch (err) {
+    if (temporaryInputPath) safeUnlink(temporaryInputPath);
     const statusCode =
       err instanceof UrlIngestionError
         ? err.statusCode
@@ -876,12 +1117,16 @@ app.post('/api/videos/from-url', async (req, res) => {
       title,
       projectId = 1,
       useAi = false,
+      editorOnly = false,
+      requestedClipCount = DEFAULT_CLIP_COUNT,
       transcriptText = '',
     } = req.body as {
       url?: string;
       title?: string;
       projectId?: number;
       useAi?: boolean;
+      editorOnly?: boolean;
+      requestedClipCount?: number;
       transcriptText?: string;
     };
 
@@ -899,6 +1144,7 @@ app.post('/api/videos/from-url', async (req, res) => {
     const cleanUrl = urlCheck.url.toString();
     const numericProjectId = Number(projectId) || 1;
     const aiEnabled = useAi === true;
+    const clipCount = normalizeClipCount(requestedClipCount);
     const cleanTranscript = typeof transcriptText === 'string' ? transcriptText.trim() : '';
 
     if (isYouTubeUrl(cleanUrl)) {
@@ -911,7 +1157,11 @@ app.post('/api/videos/from-url', async (req, res) => {
         title: (title ?? '').trim().slice(0, 120) || yt.title,
         projectId: numericProjectId,
         useAi: aiEnabled,
+        editorOnly: editorOnly === true,
+        requestedClipCount: clipCount,
         transcriptText: cleanTranscript,
+        presetSegments: !cleanTranscript && yt.segments.length > 0 ? yt.segments : undefined,
+        transcriptSource: !cleanTranscript && yt.segments.length > 0 ? 'srt' : undefined,
       });
 
       // If YouTube provided native captions and user didn't override, persist them immediately
@@ -979,6 +1229,8 @@ app.post('/api/videos/from-url', async (req, res) => {
         progress: 10,
         message: 'Remote video stream verified & queued (Audio-First + Fast Seek)...',
         useAi: aiEnabled,
+        editorOnly: editorOnly === true,
+        requestedClipCount: clipCount,
         updatedAt: new Date().toISOString(),
       };
       db.processingJobs.push(j);
@@ -1001,6 +1253,8 @@ app.post('/api/videos/from-url', async (req, res) => {
       videoId: video.id,
       jobId: job.id,
       useAi: aiEnabled,
+      editorOnly: editorOnly === true,
+      requestedClipCount: clipCount,
       suppliedTranscript: cleanTranscript,
     });
 
@@ -1025,6 +1279,7 @@ app.post('/api/videos/from-url', async (req, res) => {
 app.post('/api/videos/:id/retry', async (req, res) => {
   const videoId = Number(req.params.id);
   const useAi = req.body?.useAi === true;
+  const requestedClipCount = normalizeClipCount(req.body?.requestedClipCount);
   const db = readDb();
   const video = db.videos.find((v) => v.id === videoId);
   if (!video) {
@@ -1042,6 +1297,7 @@ app.post('/api/videos/:id/retry', async (req, res) => {
       progress: 10,
       message: 'Retrying video pipeline in sequential queue...',
       useAi,
+      requestedClipCount,
       updatedAt: new Date().toISOString(),
     };
     state.processingJobs.push(j);
@@ -1057,6 +1313,7 @@ app.post('/api/videos/:id/retry', async (req, res) => {
     videoId,
     jobId: job.id,
     useAi,
+    requestedClipCount,
     presetSegments: existingTranscript?.segments,
     transcriptSource: existingTranscript?.source,
   });
@@ -1069,7 +1326,9 @@ app.post('/api/videos/:id/process', async (req, res) => {
   const { useAi = false, transcriptText } = req.body as {
     useAi?: boolean;
     transcriptText?: string;
+    requestedClipCount?: number;
   };
+  const requestedClipCount = normalizeClipCount(req.body?.requestedClipCount);
   const db = readDb();
   const video = db.videos.find((v) => v.id === videoId);
   if (!video) {
@@ -1088,6 +1347,7 @@ app.post('/api/videos/:id/process', async (req, res) => {
       progress: 10,
       message: 'Re-running moment detection pipeline...',
       useAi,
+      requestedClipCount,
       updatedAt: new Date().toISOString(),
     };
     state.processingJobs.push(j);
@@ -1098,6 +1358,7 @@ app.post('/api/videos/:id/process', async (req, res) => {
     videoId,
     jobId: job.id,
     useAi,
+    requestedClipCount,
     suppliedTranscript: transcriptText,
     presetSegments: !transcriptText && existingTranscript ? existingTranscript.segments : undefined,
     transcriptSource: existingTranscript?.source,
@@ -1160,13 +1421,13 @@ app.get('/api/videos/:id/preview', async (req, res) => {
         const seekArgs = hasWindow || totalDur > 90
           ? ['-ss', winStart.toFixed(2), '-t', winDur.toFixed(2)]
           : [];
-        const args =
+        const buildPreviewArgs = (inputPath: string) =>
           format === 'webm'
             ? [
                 '-y',
                 ...seekArgs,
                 '-i',
-                videoPath,
+                inputPath,
                 '-vf',
                 'scale=-2:480',
                 '-r',
@@ -1186,7 +1447,7 @@ app.get('/api/videos/:id/preview', async (req, res) => {
                 '-y',
                 ...seekArgs,
                 '-i',
-                videoPath,
+                inputPath,
                 '-vf',
                 'scale=-2:480',
                 '-r',
@@ -1205,10 +1466,31 @@ app.get('/api/videos/:id/preview', async (req, res) => {
                 tmpPath,
               ];
 
-        pending = execFileAsync('ffmpeg', args, { timeout: 90000 })
-          .then(() => {
-            fs.renameSync(tmpPath, outPath);
-          })
+        pending = (async () => {
+          try {
+            await execFileAsync('ffmpeg', buildPreviewArgs(videoPath), {
+              timeout: videoPath.startsWith('http') ? 120000 : 90000,
+              maxBuffer: 16 * 1024 * 1024,
+            });
+          } catch (remoteError) {
+            safeUnlink(tmpPath);
+            if (!video.storageKey) throw remoteError;
+            let localSource: string | undefined;
+            try {
+              localSource = await downloadObjectStorageKeyToTemp({
+                key: video.storageKey,
+                extension: path.extname(video.originalName || video.filename) || '.mp4',
+              });
+              await execFileAsync('ffmpeg', buildPreviewArgs(localSource), {
+                timeout: 5 * 60 * 1000,
+                maxBuffer: 16 * 1024 * 1024,
+              });
+            } finally {
+              if (localSource) safeUnlink(localSource);
+            }
+          }
+          fs.renameSync(tmpPath, outPath);
+        })()
           .catch((err) => {
             safeUnlink(tmpPath);
             throw err;
@@ -1238,6 +1520,47 @@ app.delete('/api/videos/:id', async (req, res) => {
     return;
   }
 
+  const videoClips = db.clips.filter((c) => c.videoId === videoId);
+  const remoteKeys = new Set<string>();
+  const cloudinaryKeys = new Set<string>([`clipforge/thumbnails/video-${videoId}-cover`]);
+  const subtitleDocuments = new Set<string>();
+  for (const key of [video.storageKey, objectKeyFromUrl(video.sourceUrl), objectKeyFromUrl(video.fileUrl), objectKeyFromUrl(video.thumbnailUrl)]) {
+    if (key) remoteKeys.add(key);
+  }
+  for (const clip of videoClips) {
+    cloudinaryKeys.add(`clipforge/thumbnails/clip-${clip.id}-preview`);
+    for (const key of [clip.exportedKey, clip.srtKey, clip.thumbnailKey]) {
+      if (!key) continue;
+      if (key.startsWith('clipforge/')) cloudinaryKeys.add(key);
+      else remoteKeys.add(key);
+    }
+    if (clip.subtitleDocumentId) subtitleDocuments.add(clip.subtitleDocumentId);
+    subtitleDocuments.add(clipSubtitleDocumentId(clip.id, 'vertical'));
+    subtitleDocuments.add(clipSubtitleDocumentId(clip.id, 'horizontal'));
+    for (const url of [clip.exportedUrl, clip.srtUrl, clip.thumbnailUrl]) {
+      const key = objectKeyFromUrl(url);
+      if (key) remoteKeys.add(key);
+    }
+    for (const variant of Object.values(clip.exportVariants ?? {})) {
+      for (const key of [variant?.exportedKey, variant?.srtKey, variant?.thumbnailKey]) {
+        if (!key) continue;
+        if (key.startsWith('clipforge/')) cloudinaryKeys.add(key);
+        else remoteKeys.add(key);
+      }
+      if (variant?.subtitleDocumentId) subtitleDocuments.add(variant.subtitleDocumentId);
+      for (const url of [variant?.exportedUrl, variant?.srtUrl, variant?.thumbnailUrl]) {
+        const key = objectKeyFromUrl(url);
+        if (key) remoteKeys.add(key);
+      }
+    }
+  }
+  const removedRemoteObjects = await deleteObjectStorageKeys(remoteKeys);
+  const removedCloudinaryImages = await deleteCloudinaryKeys(cloudinaryKeys);
+  let removedSubtitleDocuments = 0;
+  for (const documentId of subtitleDocuments) {
+    if (await deleteSubtitleText(documentId)) removedSubtitleDocuments++;
+  }
+
   if (!video.sourceUrl) {
     safeUnlink(path.join(UPLOADS_DIR, path.basename(video.filename)));
   }
@@ -1248,7 +1571,6 @@ app.delete('/api/videos/:id', async (req, res) => {
       }
     }
   }
-  const videoClips = db.clips.filter((c) => c.videoId === videoId);
   for (const clip of videoClips) {
     if (clip.exportedUrl) safeUnlink(path.join(CLIPS_DIR, path.basename(clip.exportedUrl)));
     if (clip.srtUrl) safeUnlink(path.join(CLIPS_DIR, path.basename(clip.srtUrl)));
@@ -1283,6 +1605,9 @@ app.delete('/api/videos/:id', async (req, res) => {
   res.json({
     ok: true,
     removedArtifacts,
+    removedRemoteObjects,
+    removedCloudinaryImages,
+    removedSubtitleDocuments,
     removedBytes: Math.max(0, storageBefore - getStorageUsageBytes()),
   });
 });
@@ -1441,6 +1766,24 @@ app.patch('/api/clips/:id', async (req, res) => {
     if (typeof patch.startTime === 'number') clip.startTime = Math.max(0, patch.startTime);
     if (typeof patch.endTime === 'number')
       clip.endTime = Math.max(clip.startTime + 1, patch.endTime);
+    if (Array.isArray(patch.timelineSegments)) {
+      const video = db.videos.find((item) => item.id === clip.videoId);
+      const maxDuration = Math.max(1, video?.duration ?? clip.endTime);
+      const normalized = patch.timelineSegments
+        .filter((segment) => segment && typeof segment.id === 'string' && Number.isFinite(segment.start) && Number.isFinite(segment.end))
+        .map((segment) => ({
+          id: segment.id.slice(0, 80),
+          start: Math.max(0, Math.min(maxDuration, Math.round(segment.start * 1000) / 1000)),
+          end: Math.max(0, Math.min(maxDuration, Math.round(segment.end * 1000) / 1000)),
+        }))
+        .filter((segment) => segment.end - segment.start >= 0.1)
+        .slice(0, 100);
+      if (normalized.length > 0) {
+        clip.timelineSegments = normalized;
+        clip.startTime = Math.min(...normalized.map((segment) => segment.start));
+        clip.endTime = Math.max(...normalized.map((segment) => segment.end));
+      }
+    }
     if (patch.status) clip.status = patch.status;
     if (patch.aspectRatio) clip.aspectRatio = patch.aspectRatio;
     if (patch.framingMode) clip.framingMode = patch.framingMode;
@@ -1452,6 +1795,26 @@ app.patch('/api/clips/:id', async (req, res) => {
         ...ensureClipCompositions(clip),
         ...patch.compositions,
       };
+    }
+    if (patch.compositionKeyframes && typeof patch.compositionKeyframes === 'object') {
+      const totalDuration = (clip.timelineSegments?.length
+        ? clip.timelineSegments.reduce((sum, segment) => sum + segment.end - segment.start, 0)
+        : clip.endTime - clip.startTime);
+      const next = { ...(clip.compositionKeyframes ?? {}) };
+      for (const variant of ['vertical', 'horizontal'] as const) {
+        const frames = patch.compositionKeyframes[variant];
+        if (!Array.isArray(frames)) continue;
+        next[variant] = frames
+          .filter((frame) => frame && typeof frame.id === 'string' && Number.isFinite(frame.time) && frame.composition)
+          .map((frame) => ({
+            id: frame.id.slice(0, 80),
+            time: Math.max(0, Math.min(totalDuration, Math.round(frame.time * 1000) / 1000)),
+            composition: { ...ensureClipCompositions(clip)[variant], ...frame.composition },
+          }))
+          .sort((a, b) => a.time - b.time)
+          .slice(0, 100);
+      }
+      clip.compositionKeyframes = next;
     }
     if (patch.subtitleStyle) {
       clip.subtitleStyle = { ...clip.subtitleStyle, ...patch.subtitleStyle };
@@ -1562,23 +1925,39 @@ app.post('/api/clips/:id/compile', async (req, res) => {
     }
     const trans = db.transcriptions.find((t) => t.videoId === clip.videoId);
     const videoPath = resolveVideoInputSource(video);
+    const previousExport = clip.exportVariants?.[variant];
 
     // Serialize heavy FFmpeg rendering through the single-worker queue
-    const rendered = await processingQueue.run(() =>
-      renderClipWithFfmpeg({
-        clip,
-        videoPath,
-        hasAudio: video.hasAudio,
-        segments: trans?.segments ?? [],
-        variant,
-      })
-    );
+    const rendered = await processingQueue.run(async () => {
+      let temporarySource: string | undefined;
+      try {
+        if (video.storageKey) {
+          temporarySource = await downloadObjectStorageKeyToTemp({
+            key: video.storageKey,
+            extension: path.extname(video.originalName || video.filename) || '.mp4',
+          });
+        }
+        return await renderClipWithFfmpeg({
+          clip,
+          videoPath: temporarySource ?? videoPath,
+          hasAudio: video.hasAudio,
+          segments: trans?.segments ?? [],
+          variant,
+        });
+      } finally {
+        if (temporarySource) safeUnlink(temporarySource);
+      }
+    });
 
     const updated = await mutateDb((state) => {
       const target = state.clips.find((c) => c.id === clipId);
       if (!target) return null;
       target.exportedUrl = rendered.exportedUrl;
       target.srtUrl = rendered.srtUrl;
+      target.exportedKey = rendered.exportedKey;
+      target.srtKey = rendered.srtKey;
+      target.thumbnailKey = rendered.thumbnailKey;
+      target.subtitleDocumentId = rendered.subtitleDocumentId;
       target.exportedSizeBytes = rendered.exportedSizeBytes;
       if (rendered.thumbnailUrl) target.thumbnailUrl = rendered.thumbnailUrl;
       target.exportVariants = {
@@ -1590,6 +1969,25 @@ app.post('/api/clips/:id/compile', async (req, res) => {
       return target;
     });
 
+    const obsoleteKeys = new Set<string>();
+    const obsoleteCloudinaryKeys = new Set<string>();
+    for (const key of [previousExport?.exportedKey, previousExport?.srtKey, previousExport?.thumbnailKey]) {
+      if (!key) continue;
+      if (key.startsWith('clipforge/')) obsoleteCloudinaryKeys.add(key);
+      else obsoleteKeys.add(key);
+    }
+    for (const url of [previousExport?.exportedUrl, previousExport?.srtUrl, previousExport?.thumbnailUrl]) {
+      const key = objectKeyFromUrl(url);
+      if (key) obsoleteKeys.add(key);
+    }
+    for (const key of [rendered.exportedKey, rendered.srtKey, rendered.thumbnailKey]) {
+      if (!key) continue;
+      obsoleteKeys.delete(key);
+      obsoleteCloudinaryKeys.delete(key);
+    }
+    await deleteObjectStorageKeys(obsoleteKeys);
+    await deleteCloudinaryKeys(obsoleteCloudinaryKeys);
+
     res.json(updated);
   } catch (err) {
     const message = err instanceof Error ? err.message : 'FFmpeg compilation failed';
@@ -1597,7 +1995,7 @@ app.post('/api/clips/:id/compile', async (req, res) => {
   }
 });
 
-app.get('/api/clips/:id/download', (req, res) => {
+app.get('/api/clips/:id/download', async (req, res) => {
   const clipId = Number(req.params.id);
   const format = req.query.format === 'srt' ? 'srt' : 'mp4';
   const db = readDb();
@@ -1609,11 +2007,31 @@ app.get('/api/clips/:id/download', (req, res) => {
 
   const variant: CompositionVariant = req.query.variant === 'horizontal' ? 'horizontal' : 'vertical';
   const variantExport = clip.exportVariants?.[variant];
+  const subtitleDocumentId = variantExport?.subtitleDocumentId ?? clip.subtitleDocumentId;
+  if (format === 'srt' && subtitleDocumentId && isFirestoreSubtitlesConfigured()) {
+    const srt = await readSubtitleText(subtitleDocumentId);
+    if (srt === null) {
+      res.status(404).json({ error: 'Subtitle document is missing from Firestore.' });
+      return;
+    }
+    const safeName = clip.title.replace(/[^a-zA-Z0-9_-]+/g, '-').toLowerCase().slice(0, 48) || `clip-${clip.id}`;
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}.srt"`);
+    res.type('application/x-subrip; charset=utf-8').send(srt);
+    return;
+  }
   const targetUrl = format === 'srt'
     ? variantExport?.srtUrl ?? clip.srtUrl
     : variantExport?.exportedUrl ?? clip.exportedUrl;
   if (!targetUrl) {
     res.status(400).json({ error: 'Clip has not been compiled yet. Click Compile & Export first.' });
+    return;
+  }
+
+  const remoteKey = format === 'srt'
+    ? variantExport?.srtKey ?? clip.srtKey ?? objectKeyFromUrl(targetUrl)
+    : variantExport?.exportedKey ?? clip.exportedKey ?? objectKeyFromUrl(targetUrl);
+  if (remoteKey && isObjectStorageConfigured()) {
+    res.redirect(307, buildReadableObjectUrl(remoteKey));
     return;
   }
 
@@ -1632,6 +2050,42 @@ app.get('/api/clips/:id/download', (req, res) => {
 app.delete('/api/clips/:id', async (req, res) => {
   const clipId = Number(req.params.id);
   const clip = readDb().clips.find((c) => c.id === clipId);
+  const remoteKeys = new Set<string>();
+  const cloudinaryKeys = new Set<string>();
+  const subtitleDocuments = new Set<string>();
+  if (clip) {
+    for (const key of [clip.exportedKey, clip.srtKey, clip.thumbnailKey]) {
+      if (!key) continue;
+      if (key.startsWith('clipforge/')) cloudinaryKeys.add(key);
+      else remoteKeys.add(key);
+    }
+    if (clip.subtitleDocumentId) subtitleDocuments.add(clip.subtitleDocumentId);
+    for (const url of [clip.exportedUrl, clip.srtUrl, clip.thumbnailUrl]) {
+      const key = objectKeyFromUrl(url);
+      if (key) remoteKeys.add(key);
+    }
+    for (const variant of Object.values(clip.exportVariants ?? {})) {
+      for (const key of [variant?.exportedKey, variant?.srtKey, variant?.thumbnailKey]) {
+        if (!key) continue;
+        if (key.startsWith('clipforge/')) cloudinaryKeys.add(key);
+        else remoteKeys.add(key);
+      }
+      if (variant?.subtitleDocumentId) subtitleDocuments.add(variant.subtitleDocumentId);
+      for (const url of [variant?.exportedUrl, variant?.srtUrl, variant?.thumbnailUrl]) {
+        const key = objectKeyFromUrl(url);
+        if (key) remoteKeys.add(key);
+      }
+    }
+  }
+  subtitleDocuments.add(clipSubtitleDocumentId(clipId, 'vertical'));
+  subtitleDocuments.add(clipSubtitleDocumentId(clipId, 'horizontal'));
+  cloudinaryKeys.add(`clipforge/thumbnails/clip-${clipId}-preview`);
+  const removedRemoteObjects = await deleteObjectStorageKeys(remoteKeys);
+  const removedCloudinaryImages = await deleteCloudinaryKeys(cloudinaryKeys);
+  let removedSubtitleDocuments = 0;
+  for (const documentId of subtitleDocuments) {
+    if (await deleteSubtitleText(documentId)) removedSubtitleDocuments++;
+  }
   if (clip?.exportedUrl) safeUnlink(path.join(CLIPS_DIR, path.basename(clip.exportedUrl)));
   if (clip?.srtUrl) safeUnlink(path.join(CLIPS_DIR, path.basename(clip.srtUrl)));
   for (const variant of Object.values(clip?.exportVariants ?? {})) {
@@ -1642,7 +2096,7 @@ app.delete('/api/clips/:id', async (req, res) => {
     db.clips = db.clips.filter((c) => c.id !== clipId);
   });
   const removedArtifacts = removeClipArtifactsByIds([clipId]) + reconcileOrphanedClipArtifacts();
-  res.json({ ok: true, removedArtifacts });
+  res.json({ ok: true, removedArtifacts, removedRemoteObjects, removedCloudinaryImages, removedSubtitleDocuments });
 });
 
 app.put('/api/scoring-config', async (req, res) => {

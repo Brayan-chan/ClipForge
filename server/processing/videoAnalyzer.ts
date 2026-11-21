@@ -1,8 +1,17 @@
 import { execFile, spawn } from 'node:child_process';
+import fs from 'node:fs';
 import { promisify } from 'node:util';
 import path from 'node:path';
 import { THUMBNAILS_DIR, ensureStorageDirs } from '../db';
 import { MAX_VIDEO_DURATION_SECONDS } from './validation';
+import {
+  isObjectStorageConfigured,
+  uploadLocalFileToObjectStorage,
+} from './objectStorage';
+import {
+  isCloudinaryConfigured,
+  uploadThumbnailToCloudinary,
+} from './cloudinaryImages';
 
 
 const execFileAsync = promisify(execFile);
@@ -50,22 +59,43 @@ export async function checkFfmpegBinaries(): Promise<{
 
 
 export async function analyzeVideo(filePath: string): Promise<VideoMetadata> {
-  const { stdout } = await execFileAsync(
-    'ffprobe',
-    [
-      '-v',
-      'quiet',
-      '-print_format',
-      'json',
-      '-show_format',
-      '-show_streams',
-      filePath,
-    ],
-    {
-      timeout: filePath.startsWith('http') ? 30000 : 15000,
-      maxBuffer: 16 * 1024 * 1024,
+  const remote = filePath.startsWith('http');
+  let stdout = '';
+  let lastError: unknown;
+  const attempts = remote ? 2 : 1;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const result = await execFileAsync(
+        'ffprobe',
+        [
+          '-v',
+          'error',
+          '-print_format',
+          'json',
+          '-show_format',
+          '-show_streams',
+          filePath,
+        ],
+        {
+          timeout: remote ? 120000 : 15000,
+          maxBuffer: 16 * 1024 * 1024,
+        }
+      );
+      stdout = result.stdout;
+      lastError = undefined;
+      break;
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, 1000));
     }
-  );
+  }
+  if (lastError) {
+    const detail = (lastError as { stderr?: string; killed?: boolean; code?: string | number }).stderr?.trim();
+    const timedOut = (lastError as { killed?: boolean; code?: string | number }).killed;
+    throw new Error(timedOut
+      ? 'FFprobe timed out while reading the remote object after two attempts.'
+      : `FFprobe could not read the video${detail ? `: ${detail.slice(0, 500)}` : '.'}`);
+  }
 
 
   const parsed = JSON.parse(stdout) as {
@@ -78,6 +108,7 @@ export async function analyzeVideo(filePath: string): Promise<VideoMetadata> {
       width?: number;
       height?: number;
       r_frame_rate?: string;
+      avg_frame_rate?: string;
     }>;
   };
 
@@ -100,14 +131,18 @@ export async function analyzeVideo(filePath: string): Promise<VideoMetadata> {
   let fps = 30;
 
 
-  if (videoStream.r_frame_rate) {
-    const [numerator, denominator] = videoStream.r_frame_rate
+  const frameRate = videoStream.avg_frame_rate || videoStream.r_frame_rate;
+  if (frameRate) {
+    const [numerator, denominator] = frameRate
       .split('/')
       .map(Number);
 
 
     if (numerator && denominator && denominator > 0) {
-      fps = Math.round((numerator / denominator) * 100) / 100;
+      const parsedFps = numerator / denominator;
+      if (parsedFps >= 1 && parsedFps <= 240) {
+        fps = Math.round(parsedFps * 100) / 100;
+      }
     }
   }
 
@@ -153,21 +188,26 @@ export async function detectSceneChanges(
   videoPath: string,
   durationSeconds: number
 ): Promise<number[]> {
-  if (videoPath.startsWith('http') || durationSeconds > 600) {
+  if (videoPath.startsWith('http')) {
     return [];
   }
 
-
+  const isLongVideo = durationSeconds > 600;
+  const inputArgs = isLongVideo
+    ? ['-skip_frame', 'nokey', '-i', videoPath]
+    : ['-i', videoPath];
+  const visualFilter = isLongVideo
+    ? "scale=192:-2,select='gt(scene,0.055)',showinfo"
+    : "scale=320:-2,select='gt(scene,0.22)',showinfo";
   return new Promise<number[]>((resolve) => {
     const ffmpeg = spawn(
       'ffmpeg',
       [
         '-hide_banner',
         '-nostdin',
-        '-i',
-        videoPath,
+        ...inputArgs,
         '-vf',
-        "scale=320:-2,select='gt(scene,0.28)',showinfo",
+        visualFilter,
         '-an',
         '-f',
         'null',
@@ -187,7 +227,7 @@ export async function detectSceneChanges(
     // Dynamic timeout: enough time for longer videos, but bounded.
     const timeoutMs = Math.min(
       15 * 60 * 1000,
-      Math.max(60_000, durationSeconds * 2_000)
+      Math.max(60_000, durationSeconds * (isLongVideo ? 550 : 2_000))
     );
 
 
@@ -299,8 +339,23 @@ export async function generateThumbnail(
     );
 
 
+    if (isCloudinaryConfigured()) {
+      const uploaded = await uploadThumbnailToCloudinary(outPath, safeName);
+      await fs.promises.unlink(outPath).catch(() => undefined);
+      return uploaded.url;
+    }
+    if (isObjectStorageConfigured()) {
+      const remoteUrl = await uploadLocalFileToObjectStorage({
+        filePath: outPath,
+        key: `thumbnails/${safeName}`,
+        contentType: 'image/jpeg',
+      });
+      await fs.promises.unlink(outPath).catch(() => undefined);
+      return remoteUrl;
+    }
     return `/storage/thumbnails/${safeName}`;
   } catch {
+    await fs.promises.unlink(outPath).catch(() => undefined);
     return null;
   }
 }

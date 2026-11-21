@@ -3,6 +3,7 @@ import type {
   JobStage,
   TranscriptSegment,
 } from '../src/types';
+import fs from 'node:fs';
 import { ensureClipCompositions } from '../src/utils/composition';
 import {
   DEFAULT_SUBTITLE_STYLE,
@@ -53,6 +54,9 @@ export async function runVideoPipeline(params: {
   suppliedTranscript?: string;
   presetSegments?: TranscriptSegment[];
   transcriptSource?: 'gemini' | 'srt' | 'manual' | 'sample';
+  requestedClipCount?: number;
+  temporaryInputPath?: string;
+  editorOnly?: boolean;
 }): Promise<void> {
   const {
     videoId,
@@ -61,7 +65,11 @@ export async function runVideoPipeline(params: {
     suppliedTranscript,
     presetSegments,
     transcriptSource,
+    requestedClipCount = 5,
+    temporaryInputPath,
+    editorOnly = false,
   } = params;
+  const maxClips = Math.max(1, Math.min(10, Math.round(requestedClipCount)));
 
   await processingQueue.run(async () => {
     try {
@@ -76,7 +84,7 @@ export async function runVideoPipeline(params: {
         }
       });
 
-      const videoPath = resolveVideoInputSource(initialVideo);
+      const videoPath = temporaryInputPath ?? resolveVideoInputSource(initialVideo);
 
       // Stage 1: Stream metadata + visual scene change detection
       await updateJob(
@@ -86,7 +94,6 @@ export async function runVideoPipeline(params: {
         'Inspecting streams, duration & visual scene changes via FFmpeg...'
       );
       const meta = await analyzeVideo(videoPath);
-      const sceneTimestamps = await detectSceneChanges(videoPath, meta.duration);
       const coverUrl = await generateThumbnail(
         videoPath,
         `video-${videoId}-cover.jpg`,
@@ -104,6 +111,56 @@ export async function runVideoPipeline(params: {
           if (coverUrl) v.thumbnailUrl = coverUrl;
         }
       });
+
+      if (editorOnly) {
+        let createdClipId = 0;
+        await mutateDb((db) => {
+          db.clips = db.clips.filter((clip) => clip.videoId !== videoId);
+          createdClipId = db.nextIds.clip++;
+          db.clips.push({
+            id: createdClipId,
+            videoId,
+            title: initialVideo.title,
+            hookText: '',
+            hookType: 'manual-import',
+            contextStatus: 'self-contained',
+            sceneChanges: 0,
+            startTime: 0,
+            endTime: meta.duration,
+            score: 0,
+            breakdown: { hook: 0, infoValue: 0, emotion: 0, selfContained: 0, durationFit: 0 },
+            reason: 'Imported directly for formatting and editing.',
+            scoringSource: 'manual',
+            status: 'approved',
+            aspectRatio: '9:16',
+            framingMode: 'crop',
+            cropX: 50,
+            cropY: 50,
+            zoom: 1,
+            compositions: ensureClipCompositions({}),
+            exportVariants: {},
+            subtitleStyle: { ...DEFAULT_SUBTITLE_STYLE, enabled: false },
+            exportedUrl: null,
+            srtUrl: null,
+            thumbnailUrl: coverUrl,
+            createdAt: new Date().toISOString(),
+          });
+          const video = db.videos.find((item) => item.id === videoId);
+          if (video) {
+            video.status = 'ready';
+            video.errorMessage = undefined;
+          }
+        });
+        await updateJob(
+          jobId,
+          'completed',
+          100,
+          `Video imported for editing. One full-length clip is ready in Clip Studio.`
+        );
+        return;
+      }
+
+      const sceneTimestamps = await detectSceneChanges(videoPath, meta.duration);
 
       // Stage 2 & 3: Audio extraction + Transcription (Interactions API or Local SRT/Text)
       let segments: TranscriptSegment[] = [];
@@ -145,6 +202,20 @@ export async function runVideoPipeline(params: {
         throw new Error('Could not parse any spoken transcript segments.');
       }
 
+      // Never score or export subtitle ranges beyond the real media duration.
+      // A mismatched SRT may be longer than the downloaded/cut source video.
+      segments = segments
+        .filter((segment) => segment.start < meta.duration)
+        .map((segment) => ({
+          ...segment,
+          start: Math.max(0, segment.start),
+          end: Math.min(meta.duration, Math.max(segment.start + 0.08, segment.end)),
+        }))
+        .filter((segment) => segment.end > segment.start);
+      if (segments.length === 0) {
+        throw new Error('Transcript timestamps do not overlap the video duration.');
+      }
+
       await mutateDb((db) => {
         db.transcriptions = db.transcriptions.filter((t) => t.videoId !== videoId);
         db.transcriptions.push({
@@ -174,7 +245,12 @@ export async function runVideoPipeline(params: {
         config,
         sceneTimestamps,
         audio: audioEvents,
+        maxClips,
       });
+      candidates = candidates
+        .map((candidate) => ({ ...candidate, endTime: Math.min(meta.duration, candidate.endTime) }))
+        .filter((candidate) => candidate.endTime - candidate.startTime >= 8)
+        .slice(0, maxClips);
       let scoringSource: 'heuristic' | 'gemini' = 'heuristic';
       let fallbackNote = '';
 
@@ -187,7 +263,7 @@ export async function runVideoPipeline(params: {
               82,
               'Ranking top filtered transcript excerpts via Gemini 4 Hydrogen...'
             );
-            candidates = await refineCandidatesWithGemini(candidates, config);
+            candidates = (await refineCandidatesWithGemini(candidates, config)).slice(0, maxClips);
             scoringSource = 'gemini';
           } catch (aiErr) {
             // Deterministic fallback if Gemini fails
@@ -288,6 +364,10 @@ export async function runVideoPipeline(params: {
         }
       });
       await updateJob(jobId, 'failed', 100, message);
+    } finally {
+      if (temporaryInputPath) {
+        await fs.promises.unlink(temporaryInputPath).catch(() => undefined);
+      }
     }
   });
 }

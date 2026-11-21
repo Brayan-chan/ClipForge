@@ -33,7 +33,12 @@ export async function analyzeAudioEvents(
     const { stdout, stderr } = await execFileAsync(
       'ffmpeg',
       ['-hide_banner', '-nostats', '-i', videoPath, '-vn', '-af', filter, '-f', 'null', '-'],
-      { timeout: Math.max(90000, Math.min(600000, Math.round(duration * 380))) }
+      {
+        timeout: Math.max(90000, Math.min(600000, Math.round(duration * 380))),
+        // astats emits metadata twice per second; long streams easily exceed
+        // Node's small execFile default even though the analysis is healthy.
+        maxBuffer: 64 * 1024 * 1024,
+      }
     );
     const output = `${stdout}\n${stderr}`;
     const samples: Array<{ time: number; rms: number }> = [];
@@ -51,8 +56,20 @@ export async function analyzeAudioEvents(
     const finite = samples.map((s) => s.rms).filter(Number.isFinite).sort((a, b) => a - b);
     const median = finite.length ? finite[Math.floor(finite.length * 0.5)] : -30;
     const upper = finite.length ? finite[Math.floor(finite.length * 0.85)] : median + 5;
-    const threshold = Math.max(median + 5.5, upper);
-    const rawPeaks = samples.filter((sample) => sample.rms >= threshold);
+    const threshold = Math.max(median + 4.5, upper);
+    const rawPeaks = samples.filter((sample, index) => {
+      const localValues = samples
+        .slice(Math.max(0, index - 24), index)
+        .map((item) => item.rms)
+        .filter(Number.isFinite)
+        .sort((a, b) => a - b);
+      const localMedian = localValues.length
+        ? localValues[Math.floor(localValues.length / 2)]
+        : median;
+      // Relative onset catches a restrained creator becoming slightly more
+      // animated; the global percentile still catches absolute loud events.
+      return sample.rms >= threshold || sample.rms - localMedian >= 3.2;
+    });
     const energyPeaks: number[] = [];
     for (const peak of rawPeaks) {
       const previous = energyPeaks[energyPeaks.length - 1];

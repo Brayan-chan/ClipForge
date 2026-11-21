@@ -180,8 +180,10 @@ ${JSON.stringify(promptPayload, null, 2)}`,
         config.emotionWeight +
         config.selfContainedWeight +
         config.durationWeight;
-      const score =
-        maxTotal > 0 ? Math.min(100, Math.round((rawTotal / maxTotal) * 100)) : cand.score;
+      const rawScore = maxTotal > 0 ? (rawTotal / maxTotal) * 100 : cand.score;
+      let score = Math.round(100 * Math.pow(Math.max(0, rawScore) / 100, 1.25));
+      if (cand.contextStatus !== 'self-contained') score = Math.min(score, 74);
+      score = Math.max(0, Math.min(96, score));
 
       return {
         ...cand,

@@ -10,6 +10,7 @@ import type {
   User,
   VideoRecord,
 } from '../src/types';
+import { buildReadableObjectUrl } from './processing/objectStorage';
 
 export const STORAGE_ROOT = path.resolve(process.cwd(), 'storage');
 export const UPLOADS_DIR = path.join(STORAGE_ROOT, 'uploads');
@@ -19,8 +20,12 @@ export const TRANSCRIPTS_DIR = path.join(STORAGE_ROOT, 'transcripts');
 export const DB_FILE = path.join(STORAGE_ROOT, 'clipforge.db.json');
 
 export function resolveVideoInputSource(
-  video: Pick<VideoRecord, 'filename' | 'sourceUrl'>
+  video: Pick<VideoRecord, 'filename' | 'sourceUrl' | 'storageKey'>
 ): string {
+  if (video.storageKey) return buildReadableObjectUrl(video.storageKey);
+  if (video.sourceUrl?.startsWith('r2://')) {
+    return buildReadableObjectUrl(video.sourceUrl.slice(5));
+  }
   if (video.sourceUrl && /^https?:\/\//i.test(video.sourceUrl)) {
     return video.sourceUrl;
   }

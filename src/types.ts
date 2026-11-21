@@ -29,6 +29,10 @@ export interface ClipExportVariant {
   srtUrl: string;
   exportedSizeBytes: number;
   thumbnailUrl: string | null;
+  exportedKey?: string;
+  srtKey?: string;
+  thumbnailKey?: string;
+  subtitleDocumentId?: string;
 }
 export type ClipStatus = 'candidate' | 'approved' | 'rejected' | 'exported';
 export type ContextStatus = 'self-contained' | 'partial' | 'needs-context';
@@ -65,6 +69,7 @@ export interface VideoRecord {
   originalName: string;
   fileUrl: string;
   thumbnailUrl: string | null;
+  thumbnailKey?: string;
   duration: number;
   width: number;
   height: number;
@@ -72,6 +77,7 @@ export interface VideoRecord {
   hasAudio: boolean;
   sizeBytes: number;
   sourceUrl?: string;
+  storageKey?: string;
   sourceType?: 'upload' | 'demo' | 'url' | 'youtube';
   status: 'uploaded' | 'processing' | 'ready' | 'error' | 'interrupted';
   errorMessage?: string;
@@ -125,6 +131,8 @@ export interface ClipRecord {
   sceneChanges?: number;
   startTime: number;
   endTime: number;
+  /** Non-destructive edit decision list. Order defines the exported sequence. */
+  timelineSegments?: TimelineSegment[];
   score: number;
   breakdown: ClipScoreBreakdown;
   reason: string;
@@ -139,13 +147,31 @@ export interface ClipRecord {
     vertical: ClipComposition;
     horizontal: ClipComposition;
   };
+  compositionKeyframes?: Partial<Record<'vertical' | 'horizontal', CompositionKeyframe[]>>;
   exportVariants?: Partial<Record<'vertical' | 'horizontal', ClipExportVariant>>;
   subtitleStyle: SubtitleStyle;
   exportedUrl: string | null;
   srtUrl: string | null;
   thumbnailUrl: string | null;
   exportedSizeBytes?: number;
+  exportedKey?: string;
+  srtKey?: string;
+  thumbnailKey?: string;
+  subtitleDocumentId?: string;
   createdAt: string;
+}
+
+export interface TimelineSegment {
+  id: string;
+  start: number;
+  end: number;
+}
+
+export interface CompositionKeyframe {
+  id: string;
+  /** Seconds on the edited clip timeline, not the original source clock. */
+  time: number;
+  composition: ClipComposition;
 }
 
 export interface ProcessingJob {
@@ -156,6 +182,8 @@ export interface ProcessingJob {
   progress: number;
   message: string;
   useAi: boolean;
+  requestedClipCount?: number;
+  editorOnly?: boolean;
   updatedAt: string;
 }
 
@@ -176,6 +204,8 @@ export interface SystemStatus {
   geminiConfigured: boolean;
   maxUploadSizeBytes?: number;
   objectStorageConfigured?: boolean;
+  firestoreSubtitlesConfigured?: boolean;
+  cloudinaryConfigured?: boolean;
   storageBytes: number;
   activeQueueTasks: number;
   queuedTasks: number;

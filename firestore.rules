@@ -1,0 +1,12 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ClipForge reads and writes subtitles through the trusted Express backend.
+    // Service-account requests bypass client security rules. Keep direct browser
+    // access closed until the app has real per-user ownership and authorization.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

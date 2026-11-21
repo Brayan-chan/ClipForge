@@ -4,6 +4,7 @@ import {
   Download,
   Film,
   Loader2,
+  MoreHorizontal,
   Pause,
   Play,
   Plus,
@@ -23,9 +24,11 @@ import type {
   ClipRecord,
   ClipComposition,
   CompositionRegion,
+  CompositionKeyframe,
   ScoringConfig,
   SubtitleStyle,
   TranscriptSegment,
+  TimelineSegment,
   TranscriptionRecord,
   VideoRecord,
 } from '../types';
@@ -259,6 +262,8 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
   const compositionCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const previewDrawRef = useRef<() => void>(() => {});
   const pendingSeekRef = useRef<number | null>(null);
+  const timelinePlaybackIndexRef = useRef(0);
+  const resumeTimelinePlaybackRef = useRef(false);
   const [inspectorTab, setInspectorTab] = useState<'score' | 'subtitles' | 'transcript'>('score');
   const [previewSource, setPreviewSource] = useState<'live' | 'compiled'>(
     activeClip?.exportedUrl ? 'compiled' : 'live'
@@ -269,6 +274,11 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
+  const [selectedTimelineSegmentId, setSelectedTimelineSegmentId] = useState<string | null>(null);
+  const [draggedTimelineSegmentId, setDraggedTimelineSegmentId] = useState<string | null>(null);
+  const [timelineMenuSegmentId, setTimelineMenuSegmentId] = useState<string | null>(null);
+  const [timelineUndoSegments, setTimelineUndoSegments] = useState<TimelineSegment[] | null>(null);
+  const [recentSplit, setRecentSplit] = useState<{ leftId: string; rightId: string } | null>(null);
   const [liveWindow, setLiveWindow] = useState<{ start: number; end: number }>({
     start: Math.max(0, Math.floor((activeClip?.startTime ?? 0) - 4)),
     end: Math.min(
@@ -304,7 +314,33 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
   const isUsingWindowedLive =
     previewSource === 'live' && Boolean(activeVideo) && (isLargeOrLongVideo || fallbackMode !== 'none');
   const windowOffset = isUsingWindowedLive ? liveWindow.start : 0;
-  const activeComposition = draft ? getClipComposition(draft, activeVariant) : null;
+  const editedTimelineDuration = draft
+    ? (draft.timelineSegments?.length
+      ? draft.timelineSegments.reduce((sum, segment) => sum + segment.end - segment.start, 0)
+      : draft.endTime - draft.startTime)
+    : 0;
+  const logicalPlayheadTime = (() => {
+    if (!draft || previewSource === 'compiled') return currentTime;
+    const timeline = draft.timelineSegments?.length
+      ? draft.timelineSegments
+      : [{ id: `clip-${draft.id}-base`, start: draft.startTime, end: draft.endTime }];
+    let offset = 0;
+    for (const segment of timeline) {
+      if (currentTime >= segment.start && currentTime <= segment.end) {
+        return offset + currentTime - segment.start;
+      }
+      offset += segment.end - segment.start;
+    }
+    return 0;
+  })();
+  const variantKeyframes = draft?.compositionKeyframes?.[activeVariant] ?? [];
+  const activeCompositionKeyframe = [...variantKeyframes]
+    .sort((a, b) => a.time - b.time)
+    .filter((frame) => frame.time <= logicalPlayheadTime + 0.001)
+    .at(-1) ?? null;
+  const activeComposition = draft
+    ? activeCompositionKeyframe?.composition ?? getClipComposition(draft, activeVariant)
+    : null;
   const activeVariantExport = draft?.exportVariants?.[activeVariant];
   const subtitleRegion: CompositionRegion = draft?.subtitleStyle.region ?? {
     x: 8,
@@ -347,6 +383,10 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
     setMediaError(null);
     setIsPlaying(false);
     pendingSeekRef.current = null;
+    setSelectedTimelineSegmentId(activeClip?.timelineSegments?.[0]?.id ?? null);
+    setTimelineMenuSegmentId(null);
+    setTimelineUndoSegments(null);
+    setRecentSplit(null);
     if (activeClip && activeVideo) {
       setLiveWindow(
         computeWindowForRange(activeClip.startTime, activeClip.endTime, activeVideo.duration)
@@ -388,14 +428,164 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
     }
   };
 
+  const getTimelineSegments = (clip: ClipRecord): TimelineSegment[] =>
+    clip.timelineSegments?.length
+      ? clip.timelineSegments
+      : [{ id: `clip-${clip.id}-base`, start: clip.startTime, end: clip.endTime }];
+
+  const updateTimelineSegments = (segments: TimelineSegment[]) => {
+    if (!draft || segments.length === 0) return;
+    updateDraftLive({
+      ...draft,
+      timelineSegments: segments,
+      startTime: Math.min(...segments.map((segment) => segment.start)),
+      endTime: Math.max(...segments.map((segment) => segment.end)),
+    });
+    if (!segments.some((segment) => segment.id === selectedTimelineSegmentId)) {
+      setSelectedTimelineSegmentId(segments[0].id);
+    }
+  };
+
+  const seekToEditedTime = (time: number) => {
+    if (!draft) return;
+    const timeline = getTimelineSegments(draft);
+    let offset = 0;
+    for (const segment of timeline) {
+      const duration = segment.end - segment.start;
+      if (time <= offset + duration) {
+        seekTo(segment.start + Math.max(0, time - offset));
+        return;
+      }
+      offset += duration;
+    }
+    seekTo(timeline[timeline.length - 1].end);
+  };
+
+  const splitTimelineAtPlayhead = () => {
+    if (!draft || previewSource === 'compiled') return;
+    const segments = getTimelineSegments(draft);
+    const index = segments.findIndex((segment) => currentTime > segment.start + 0.1 && currentTime < segment.end - 0.1);
+    if (index < 0) {
+      setFeedback({ type: 'err', text: 'Place the playhead inside a segment before cutting.' });
+      return;
+    }
+    const source = segments[index];
+    const splitAt = Math.round(currentTime * 1000) / 1000;
+    const next = [...segments];
+    const left = { ...source, id: `${source.id}-a-${Date.now()}`, end: splitAt };
+    const right = { ...source, id: `${source.id}-b-${Date.now()}`, start: splitAt };
+    next.splice(index, 1, left, right);
+    setTimelineUndoSegments(segments);
+    updateTimelineSegments(next);
+    setSelectedTimelineSegmentId(right.id);
+    setRecentSplit({ leftId: left.id, rightId: right.id });
+    setFeedback({ type: 'ok', text: `Cut created at ${formatTimecode(splitAt, true)}.` });
+  };
+
+  const applyTimelineRemoval = (next: TimelineSegment[], message: string) => {
+    if (!draft || next.length === 0) {
+      setFeedback({ type: 'err', text: 'La timeline debe conservar al menos un fragmento.' });
+      return;
+    }
+    const segments = getTimelineSegments(draft);
+    setTimelineUndoSegments(segments);
+    updateTimelineSegments(next);
+    setTimelineMenuSegmentId(null);
+    setRecentSplit(null);
+    setFeedback({ type: 'ok', text: message });
+  };
+
+  const deleteTimelineSegment = (segmentId: string) => {
+    if (!draft) return;
+    const segments = getTimelineSegments(draft);
+    if (segments.length <= 1) {
+      setFeedback({ type: 'err', text: 'No puedes eliminar el único fragmento de la timeline.' });
+      return;
+    }
+    const index = segments.findIndex((segment) => segment.id === segmentId);
+    const next = segments.filter((segment) => segment.id !== segmentId);
+    applyTimelineRemoval(next, 'Fragmento eliminado. Puedes deshacer la acción.');
+    const fallback = next[Math.min(Math.max(0, index), next.length - 1)];
+    setSelectedTimelineSegmentId(fallback.id);
+    seekTo(fallback.start);
+  };
+
+  const undoTimelineEdit = () => {
+    if (!timelineUndoSegments) return;
+    const current = draft ? getTimelineSegments(draft) : null;
+    updateTimelineSegments(timelineUndoSegments);
+    setTimelineUndoSegments(current);
+    setFeedback({ type: 'ok', text: 'Edición de timeline restaurada.' });
+  };
+
+  const reorderTimelineSegment = (targetId: string) => {
+    if (!draft || !draggedTimelineSegmentId || draggedTimelineSegmentId === targetId) return;
+    const segments = [...getTimelineSegments(draft)];
+    const from = segments.findIndex((segment) => segment.id === draggedTimelineSegmentId);
+    const to = segments.findIndex((segment) => segment.id === targetId);
+    if (from < 0 || to < 0) return;
+    const [moved] = segments.splice(from, 1);
+    segments.splice(to, 0, moved);
+    setTimelineUndoSegments(getTimelineSegments(draft));
+    updateTimelineSegments(segments);
+    setDraggedTimelineSegmentId(null);
+  };
+
   const updateComposition = (patch: Partial<ClipComposition>) => {
     if (!draft) return;
     const compositions = ensureClipCompositions(draft);
-    const nextComposition = { ...compositions[activeVariant], ...patch };
+    const nextComposition = { ...(activeComposition ?? compositions[activeVariant]), ...patch };
+    if (activeCompositionKeyframe) {
+      const nextFrames = variantKeyframes.map((frame) =>
+        frame.id === activeCompositionKeyframe.id
+          ? { ...frame, composition: nextComposition }
+          : frame
+      );
+      updateDraftLive({
+        ...draft,
+        aspectRatio: nextComposition.aspectRatio,
+        compositionKeyframes: { ...(draft.compositionKeyframes ?? {}), [activeVariant]: nextFrames },
+      });
+      return;
+    }
     updateDraftLive({
       ...draft,
       aspectRatio: nextComposition.aspectRatio,
       compositions: { ...compositions, [activeVariant]: nextComposition },
+    });
+  };
+
+  const addCompositionKeyframe = () => {
+    if (!draft || !activeComposition) return;
+    const time = Math.max(0, Math.min(editedTimelineDuration, Math.round(logicalPlayheadTime * 1000) / 1000));
+    const existing = variantKeyframes.find((frame) => Math.abs(frame.time - time) < 0.05);
+    if (existing) {
+      setFeedback({ type: 'err', text: 'Ya existe un keyframe en esta posición.' });
+      return;
+    }
+    const frame: CompositionKeyframe = {
+      id: `composition-${activeVariant}-${Date.now()}`,
+      time,
+      composition: { ...activeComposition, camera: { ...activeComposition.camera }, content: { ...activeComposition.content } },
+    };
+    updateDraftLive({
+      ...draft,
+      compositionKeyframes: {
+        ...(draft.compositionKeyframes ?? {}),
+        [activeVariant]: [...variantKeyframes, frame].sort((a, b) => a.time - b.time),
+      },
+    });
+    setFeedback({ type: 'ok', text: `Keyframe añadido en ${formatTimecode(time, true)}. Ajusta Cámara o Contenido.` });
+  };
+
+  const removeActiveCompositionKeyframe = () => {
+    if (!draft || !activeCompositionKeyframe) return;
+    updateDraftLive({
+      ...draft,
+      compositionKeyframes: {
+        ...(draft.compositionKeyframes ?? {}),
+        [activeVariant]: variantKeyframes.filter((frame) => frame.id !== activeCompositionKeyframe.id),
+      },
     });
   };
 
@@ -504,6 +694,10 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
         el.currentTime = bounded;
       }
       setCurrentTime(windowOffset + bounded);
+      if (resumeTimelinePlaybackRef.current) {
+        resumeTimelinePlaybackRef.current = false;
+        void el.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
+      }
     }
   };
 
@@ -516,8 +710,26 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
     }
     const absSec = windowOffset + el.currentTime;
     setCurrentTime(absSec);
-    if (draft && isPlaying && absSec >= draft.endTime) {
-      el.currentTime = Math.max(0, draft.startTime - windowOffset);
+    if (draft && isPlaying) {
+      const timeline = getTimelineSegments(draft);
+      const index = Math.min(timeline.length - 1, timelinePlaybackIndexRef.current);
+      const active = timeline[index];
+      if (absSec >= active.end - 0.015) {
+        const nextIndex = index + 1;
+        if (nextIndex >= timeline.length) {
+          el.pause();
+          setIsPlaying(false);
+          timelinePlaybackIndexRef.current = 0;
+          seekTo(timeline[0].start);
+        } else {
+          timelinePlaybackIndexRef.current = nextIndex;
+          const nextTime = timeline[nextIndex].start;
+          if (isUsingWindowedLive && (nextTime < liveWindow.start || nextTime > liveWindow.end)) {
+            resumeTimelinePlaybackRef.current = true;
+          }
+          seekTo(nextTime);
+        }
+      }
     }
   };
 
@@ -527,8 +739,11 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
     if (el.paused) {
       if (previewSource === 'live' && el.readyState >= 1 && draft) {
         const absSec = windowOffset + el.currentTime;
-        if (absSec < draft.startTime || absSec >= draft.endTime) {
-          el.currentTime = Math.max(0, draft.startTime - windowOffset);
+        const timeline = getTimelineSegments(draft);
+        const index = timeline.findIndex((segment) => absSec >= segment.start && absSec < segment.end);
+        timelinePlaybackIndexRef.current = index >= 0 ? index : 0;
+        if (index < 0) {
+          el.currentTime = Math.max(0, timeline[0].start - windowOffset);
         }
       }
       try {
@@ -759,6 +974,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
         title: draft.title,
         startTime: draft.startTime,
         endTime: draft.endTime,
+        timelineSegments: getTimelineSegments(draft),
         status: draft.status,
         aspectRatio: draft.aspectRatio,
         framingMode: draft.framingMode,
@@ -766,6 +982,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
         cropY: draft.cropY,
         zoom: draft.zoom,
         compositions: ensureClipCompositions(draft),
+        compositionKeyframes: draft.compositionKeyframes,
         subtitleStyle: draft.subtitleStyle,
       });
       setDraft(updated);
@@ -786,12 +1003,14 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
         title: draft.title,
         startTime: draft.startTime,
         endTime: draft.endTime,
+        timelineSegments: getTimelineSegments(draft),
         aspectRatio: draft.aspectRatio,
         framingMode: draft.framingMode,
         cropX: draft.cropX,
         cropY: draft.cropY,
         zoom: draft.zoom,
         compositions: ensureClipCompositions(draft),
+        compositionKeyframes: draft.compositionKeyframes,
         subtitleStyle: draft.subtitleStyle,
       });
       const compiled = await onCompileClip(draft.id, activeVariant);
@@ -926,7 +1145,9 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
     );
   }
 
-  const clipDuration = draft ? Math.max(1, draft.endTime - draft.startTime) : 0;
+  const clipDuration = draft
+    ? Math.max(0.1, getTimelineSegments(draft).reduce((sum, segment) => sum + segment.end - segment.start, 0))
+    : 0;
 
   return (
     <main className="mx-auto max-w-[1440px] px-4 py-4 sm:px-6">
@@ -1543,7 +1764,116 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                   )}
                 </div>
 
-                <div className="grid grid-cols-1 gap-2.5 xl:grid-cols-2">
+                {previewSource === 'live' && (
+                  <div className="space-y-2 rounded-lg border border-slate-200 p-2.5 dark:border-white/10">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <div className="text-xs font-semibold text-slate-800 dark:text-slate-100">Timeline de edición</div>
+                        <div className="text-[10px] text-slate-500">Mueve el cabezal y corta. Arrastra los fragmentos para cambiar su orden.</div>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <button type="button" onClick={addCompositionKeyframe}
+                          className="inline-flex items-center gap-1 rounded-md border border-violet-500/40 bg-violet-500/10 px-2.5 py-1.5 text-[11px] font-semibold text-violet-700 hover:bg-violet-500/20 dark:text-violet-300">
+                          <Plus className="h-3.5 w-3.5" /> Cambio de cámara
+                        </button>
+                        {activeCompositionKeyframe && (
+                          <button type="button" onClick={removeActiveCompositionKeyframe} title="Eliminar keyframe activo"
+                            className="rounded-md border border-violet-500/30 p-1.5 text-violet-600 hover:bg-violet-500/10 dark:text-violet-300">
+                            <X className="h-3.5 w-3.5" />
+                          </button>
+                        )}
+                        <button type="button" onClick={splitTimelineAtPlayhead}
+                          className="inline-flex items-center gap-1 rounded-md bg-emerald-500 px-2.5 py-1.5 text-[11px] font-semibold text-slate-950 hover:bg-emerald-400">
+                          <Scissors className="h-3.5 w-3.5" /> Cortar
+                        </button>
+                        {timelineUndoSegments && (
+                          <button type="button" onClick={undoTimelineEdit}
+                            className="inline-flex items-center gap-1 rounded-md border border-slate-300 px-2.5 py-1.5 text-[11px] font-medium hover:bg-slate-100 dark:border-white/15 dark:hover:bg-white/5">
+                            <RotateCcw className="h-3.5 w-3.5" /> Deshacer
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    {recentSplit && (
+                      <div className="flex flex-wrap items-center gap-1.5 rounded-md border border-emerald-500/30 bg-emerald-500/10 p-2 text-[10px]">
+                        <span className="mr-auto font-semibold">Corte creado. ¿Qué parte quieres eliminar?</span>
+                        <button type="button" onClick={() => deleteTimelineSegment(recentSplit.leftId)}
+                          className="rounded border border-red-500/30 px-2 py-1 text-red-600 hover:bg-red-500/10 dark:text-red-400">Eliminar inicio</button>
+                        <button type="button" onClick={() => deleteTimelineSegment(recentSplit.rightId)}
+                          className="rounded border border-red-500/30 px-2 py-1 text-red-600 hover:bg-red-500/10 dark:text-red-400">Eliminar final</button>
+                        <button type="button" onClick={() => setRecentSplit(null)}
+                          className="rounded border border-slate-300 px-2 py-1 hover:bg-white/60 dark:border-white/15 dark:hover:bg-white/10">Conservar ambas</button>
+                      </div>
+                    )}
+                    {variantKeyframes.length > 0 && <div className="space-y-1">
+                      <div className="flex items-center justify-between text-[10px] text-slate-500">
+                        <span>Composición · {activeVariant === 'vertical' ? 'Vertical 9:16' : 'Horizontal 16:9'}</span>
+                        <span>{variantKeyframes.length} cambios</span>
+                      </div>
+                      <div className="relative h-7 overflow-hidden rounded-md bg-violet-500/10 ring-1 ring-inset ring-violet-500/20"
+                        onClick={(event) => {
+                          const rect = event.currentTarget.getBoundingClientRect();
+                          seekToEditedTime(((event.clientX - rect.left) / rect.width) * editedTimelineDuration);
+                        }}>
+                        <div className="absolute inset-y-0 w-0.5 bg-white shadow"
+                          style={{ left: `${Math.min(100, Math.max(0, logicalPlayheadTime / Math.max(0.1, editedTimelineDuration) * 100))}%` }} />
+                        {variantKeyframes.map((frame) => (
+                          <button key={frame.id} type="button" title={`Keyframe ${formatTimecode(frame.time, true)}`}
+                            onClick={(event) => { event.stopPropagation(); seekToEditedTime(frame.time); }}
+                            className={`absolute top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rotate-45 border ${activeCompositionKeyframe?.id === frame.id ? 'border-white bg-violet-400' : 'border-violet-300 bg-violet-600'}`}
+                            style={{ left: `${frame.time / Math.max(0.1, editedTimelineDuration) * 100}%` }} />
+                        ))}
+                      </div>
+                    </div>}
+                    <div className="flex min-h-12 gap-1.5 overflow-x-auto pb-1">
+                      {getTimelineSegments(draft).map((segment, index) => {
+                        const selected = selectedTimelineSegmentId === segment.id;
+                        return (
+                          <div key={segment.id} draggable
+                            onDragStart={() => setDraggedTimelineSegmentId(segment.id)}
+                            onDragOver={(event) => event.preventDefault()}
+                            onDrop={() => reorderTimelineSegment(segment.id)}
+                            onClick={() => { setSelectedTimelineSegmentId(segment.id); seekTo(segment.start); }}
+                            style={{ flexGrow: Math.max(1, segment.end - segment.start) }}
+                            className={`relative min-w-32 cursor-grab rounded-md border-2 p-2 transition-colors active:cursor-grabbing ${selected ? 'border-amber-400 bg-amber-400/15 shadow-sm shadow-amber-500/20' : 'border-slate-200 bg-slate-50 hover:border-emerald-500/50 dark:border-white/10 dark:bg-white/[0.03]'}`}>
+                            <div className="flex items-center justify-between text-[10px]">
+                              <span className="font-semibold">{selected ? '✓ ' : ''}Fragmento {index + 1}</span>
+                              <div className="flex items-center gap-1">
+                                <span className="font-mono">{(segment.end - segment.start).toFixed(2)}s</span>
+                                <button type="button" aria-label={`Opciones del fragmento ${index + 1}`}
+                                  onClick={(event) => { event.stopPropagation(); setSelectedTimelineSegmentId(segment.id); setTimelineMenuSegmentId((value) => value === segment.id ? null : segment.id); }}
+                                  className="rounded p-0.5 hover:bg-black/10 dark:hover:bg-white/10">
+                                  <MoreHorizontal className="h-3.5 w-3.5" />
+                                </button>
+                              </div>
+                            </div>
+                            <div className="mt-1 font-mono text-[10px] text-slate-500">
+                              {formatTimecode(segment.start, true)} → {formatTimecode(segment.end, true)}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    {timelineMenuSegmentId && (() => {
+                      const segments = getTimelineSegments(draft);
+                      const index = segments.findIndex((segment) => segment.id === timelineMenuSegmentId);
+                      const segment = segments[index];
+                      if (!segment) return null;
+                      return (
+                        <div className="flex flex-wrap items-center gap-1.5 rounded-md border border-amber-400/40 bg-amber-400/10 p-2 text-[10px]">
+                          <span className="mr-auto font-semibold">Fragmento {index + 1} seleccionado</span>
+                          <button type="button" onClick={() => deleteTimelineSegment(segment.id)}
+                            className="inline-flex items-center gap-1 rounded bg-red-500 px-2 py-1 font-semibold text-white hover:bg-red-600">
+                            <Trash2 className="h-3 w-3" /> Eliminar fragmento
+                          </button>
+                          <button type="button" onClick={() => setTimelineMenuSegmentId(null)} className="rounded p-1 hover:bg-black/10 dark:hover:bg-white/10" aria-label="Cerrar opciones"><X className="h-3 w-3" /></button>
+                        </div>
+                      );
+                    })()}
+                  </div>
+                )}
+
+                {previewSource !== 'live' && <div className="grid grid-cols-1 gap-2.5 xl:grid-cols-2">
                   <div className="flex min-w-0 items-center justify-between gap-2 rounded-lg border border-slate-200 px-3 py-1.5 dark:border-white/10">
                     <span className="text-xs font-medium text-slate-500 dark:text-slate-400 shrink-0">
                       {t.start}
@@ -1622,7 +1952,7 @@ export const ClipStudio: React.FC<ClipStudioProps> = ({
                       </button>
                     </div>
                   </div>
-                </div>
+                </div>}
               </div>
             </>
           ) : (

@@ -82,6 +82,115 @@ function uploadFileDirectWithProgress(
   });
 }
 
+const MULTIPART_UPLOAD_THRESHOLD_BYTES = 50 * 1024 * 1024;
+const MULTIPART_CONCURRENCY = 3;
+
+function uploadPartWithProgress(
+  putUrl: string,
+  part: Blob,
+  onProgress: (loadedBytes: number) => void
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', putUrl, true);
+    xhr.upload.onprogress = (event) => onProgress(event.loaded);
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        const etag = xhr.getResponseHeader('ETag');
+        if (etag) resolve(etag);
+        else reject(new Error('R2 uploaded the block but did not expose its ETag. Add ETag to the bucket CORS ExposeHeaders list.'));
+      } else {
+        reject(new Error(`Object storage block upload failed (${xhr.status})`));
+      }
+    };
+    xhr.onerror = () => reject(new Error('Network/CORS error uploading a block to object storage.'));
+    xhr.send(part);
+  });
+}
+
+async function uploadPartWithRetry(
+  putUrl: string,
+  part: Blob,
+  onProgress: (loadedBytes: number) => void,
+  maxAttempts = 3
+): Promise<string> {
+  let lastError: Error | null = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await uploadPartWithProgress(putUrl, part, onProgress);
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error('Block upload failed.');
+      onProgress(0);
+      if (attempt < maxAttempts) await new Promise((resolve) => setTimeout(resolve, 700 * attempt));
+    }
+  }
+  throw lastError ?? new Error('Block upload failed.');
+}
+
+async function uploadFileMultipart(
+  file: File,
+  onProgress: (loaded: number, total: number, completed: number, partCount: number) => void
+): Promise<string> {
+  const initResponse = await fetch('/api/uploads/multipart/init', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename: file.name, mimetype: file.type || 'video/mp4', sizeBytes: file.size }),
+  });
+  const init = await readJsonResponse<{ key: string; uploadId: string; partSizeBytes: number }>(initResponse);
+  const partCount = Math.ceil(file.size / init.partSizeBytes);
+  const progressByPart = new Array<number>(partCount).fill(0);
+  const completedParts: Array<{ partNumber: number; etag: string }> = [];
+  let nextIndex = 0;
+  let completed = 0;
+
+  const report = () => onProgress(
+    progressByPart.reduce((sum, value) => sum + value, 0),
+    file.size,
+    completed,
+    partCount
+  );
+
+  try {
+    const worker = async () => {
+      while (nextIndex < partCount) {
+        const index = nextIndex++;
+        const partNumber = index + 1;
+        const start = index * init.partSizeBytes;
+        const blob = file.slice(start, Math.min(file.size, start + init.partSizeBytes));
+        const urlResponse = await fetch('/api/uploads/multipart/part-url', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key: init.key, uploadId: init.uploadId, partNumber }),
+        });
+        const { putUrl } = await readJsonResponse<{ putUrl: string }>(urlResponse);
+        const etag = await uploadPartWithRetry(putUrl, blob, (loaded) => {
+          progressByPart[index] = loaded;
+          report();
+        });
+        progressByPart[index] = blob.size;
+        completedParts.push({ partNumber, etag });
+        completed++;
+        report();
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(MULTIPART_CONCURRENCY, partCount) }, worker));
+    const completeResponse = await fetch('/api/uploads/multipart/complete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: init.key, uploadId: init.uploadId, parts: completedParts }),
+    });
+    await readJsonResponse(completeResponse);
+    return init.key;
+  } catch (error) {
+    void fetch('/api/uploads/multipart/abort', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: init.key, uploadId: init.uploadId }),
+    });
+    throw error;
+  }
+}
+
 async function uploadChunkWithRetry(
   uploadId: string,
   index: number,
@@ -140,7 +249,8 @@ export const UploadModal: React.FC<UploadModalProps> = ({
   const [remoteUrl, setRemoteUrl] = useState('');
   const [title, setTitle] = useState('');
   const [projectId, setProjectId] = useState<number>(projects[0]?.id ?? 1);
-  const [mode, setMode] = useState<'heuristic' | 'ai'>('heuristic');
+  const [mode, setMode] = useState<'edit' | 'heuristic' | 'ai'>('heuristic');
+  const [requestedClipCount, setRequestedClipCount] = useState(5);
   const [transcriptText, setTranscriptText] = useState('');
   const [srtFilename, setSrtFilename] = useState<string | null>(null);
   const [uploadStats, setUploadStats] = useState<UploadTelemetry | null>(null);
@@ -234,6 +344,8 @@ export const UploadModal: React.FC<UploadModalProps> = ({
             title: title.trim() || undefined,
             projectId,
             useAi: mode === 'ai',
+            editorOnly: mode === 'edit',
+            requestedClipCount,
             transcriptText: transcriptText.trim(),
           }),
         });
@@ -284,27 +396,30 @@ export const UploadModal: React.FC<UploadModalProps> = ({
           finalizing: false,
         });
 
-        const presignRes = await fetch('/api/uploads/presign', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            filename: selectedFile.name,
-            mimetype: selectedFile.type || 'video/mp4',
-            sizeBytes: selectedFile.size,
-          }),
-        });
-        const presign = await readJsonResponse<{ key: string; putUrl: string }>(presignRes);
-
-        await uploadFileDirectWithProgress(presign.putUrl, selectedFile, (loaded, total) => {
-          setUploadStats({
-            percent: Math.min(99, Math.round((loaded / total) * 100)),
-            loadedBytes: loaded,
-            totalBytes: total,
-            completedChunks: 0,
-            totalChunks: 1,
-            finalizing: false,
+        let storageKey: string;
+        if (selectedFile.size >= MULTIPART_UPLOAD_THRESHOLD_BYTES) {
+          storageKey = await uploadFileMultipart(selectedFile, (loaded, total, completed, partCount) => {
+            setUploadStats({
+              percent: Math.min(99, Math.round((loaded / total) * 100)),
+              loadedBytes: loaded,
+              totalBytes: total,
+              completedChunks: completed,
+              totalChunks: partCount,
+              finalizing: false,
+            });
           });
-        });
+        } else {
+          const presignRes = await fetch('/api/uploads/presign', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename: selectedFile.name, mimetype: selectedFile.type || 'video/mp4', sizeBytes: selectedFile.size }),
+          });
+          const presign = await readJsonResponse<{ key: string; putUrl: string }>(presignRes);
+          storageKey = presign.key;
+          await uploadFileDirectWithProgress(presign.putUrl, selectedFile, (loaded, total) => {
+            setUploadStats({ percent: Math.min(99, Math.round((loaded / total) * 100)), loadedBytes: loaded, totalBytes: total, completedChunks: 0, totalChunks: 1, finalizing: false });
+          });
+        }
 
         setUploadStats({
           percent: 100,
@@ -319,12 +434,14 @@ export const UploadModal: React.FC<UploadModalProps> = ({
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            key: presign.key,
+            key: storageKey,
             originalName: selectedFile.name,
             sizeBytes: selectedFile.size,
             title: title.trim() || selectedFile.name,
             projectId,
             useAi: mode === 'ai',
+            editorOnly: mode === 'edit',
+            requestedClipCount,
             transcriptText: transcriptText.trim(),
           }),
         });
@@ -344,6 +461,8 @@ export const UploadModal: React.FC<UploadModalProps> = ({
           title: title.trim() || selectedFile.name,
           projectId,
           useAi: mode === 'ai',
+          editorOnly: mode === 'edit',
+          requestedClipCount,
           transcriptText: transcriptText.trim(),
         }),
       });
@@ -435,6 +554,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
         body: JSON.stringify({
           projectId,
           useAi: mode === 'ai' && geminiConfigured,
+          requestedClipCount,
         }),
       });
       const data = await readJsonResponse<{ video: { id: number }; job: ProcessingJob }>(res);
@@ -828,7 +948,27 @@ export const UploadModal: React.FC<UploadModalProps> = ({
               <label className="mb-1.5 block text-xs font-medium text-slate-600 dark:text-slate-300">
                 {t.pipelineMode}
               </label>
-              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                <button
+                  type="button"
+                  disabled={isSubmitting}
+                  onClick={() => setMode('edit')}
+                  className={`flex items-start gap-3 rounded-lg border p-3 text-left transition-colors ${
+                    mode === 'edit'
+                      ? 'border-emerald-500 bg-emerald-500/10'
+                      : 'border-slate-200 hover:border-slate-300 dark:border-white/10 dark:hover:border-white/20'
+                  }`}
+                >
+                  <Scissors className="mt-0.5 h-4 w-4 shrink-0 text-emerald-500" />
+                  <div>
+                    <div className="text-sm font-medium text-slate-900 dark:text-white">
+                      {t.modeEditTitle}
+                    </div>
+                    <div className="text-xs text-slate-500 dark:text-slate-400">
+                      {t.modeEditDesc}
+                    </div>
+                  </div>
+                </button>
                 <button
                   type="button"
                   disabled={isSubmitting}
@@ -873,7 +1013,29 @@ export const UploadModal: React.FC<UploadModalProps> = ({
               </div>
             </div>
 
-            <div>
+            {mode !== 'edit' && <div className="rounded-lg border border-slate-200 bg-slate-50/70 p-4 dark:border-white/10 dark:bg-white/[0.02]">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <label htmlFor="requested-clip-count" className="block text-sm font-medium text-slate-900 dark:text-white">
+                    {t.clipCountLabel}
+                  </label>
+                  <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t.clipCountHint}</p>
+                </div>
+                <select
+                  id="requested-clip-count"
+                  value={requestedClipCount}
+                  disabled={isSubmitting}
+                  onChange={(event) => setRequestedClipCount(Math.max(1, Math.min(10, Number(event.target.value))))}
+                  className="min-w-24 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-900 focus:border-emerald-500 focus:outline-none dark:border-white/10 dark:bg-[#181B22] dark:text-white"
+                >
+                  {Array.from({ length: 10 }, (_, index) => index + 1).map((count) => (
+                    <option key={count} value={count}>{count}</option>
+                  ))}
+                </select>
+              </div>
+            </div>}
+
+            {mode !== 'edit' && <div>
               <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
                 <label className="flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-300">
                   <FileText className="h-3.5 w-3.5" />
@@ -928,7 +1090,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
                 placeholder={t.transcriptPlaceholder}
                 className="w-full rounded-lg border border-slate-200 bg-white p-3 font-mono text-xs text-slate-900 placeholder-slate-400 focus:border-emerald-500 focus:outline-none dark:border-white/10 dark:bg-[#181B22] dark:text-slate-100"
               />
-            </div>
+            </div>}
 
             {error && (
               <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-600 dark:text-red-300 space-y-2.5">
@@ -1000,6 +1162,8 @@ export const UploadModal: React.FC<UploadModalProps> = ({
                     ? `${t.processingBtnLabel} ${activeJob.progress}%`
                     : isSubmitting && sourceMode === 'url'
                     ? t.inspectingUrl
+                    : mode === 'edit'
+                    ? t.startEditorImport
                     : t.startPipeline}
                 </span>
               </button>

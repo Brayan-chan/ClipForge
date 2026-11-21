@@ -5,6 +5,7 @@ import { createCanvas } from '@napi-rs/canvas';
 import type {
   AspectRatio,
   ClipComposition,
+  CompositionKeyframe,
   ClipRecord,
   SubtitleStyle,
   TranscriptSegment,
@@ -15,6 +16,20 @@ import {
 } from '../../src/utils/composition';
 import { CLIPS_DIR, ensureStorageDirs } from '../db';
 import { generateThumbnail } from './videoAnalyzer';
+import {
+  isObjectStorageConfigured,
+  objectKeyFromUrl,
+  uploadLocalFileToObjectStorage,
+} from './objectStorage';
+import {
+  clipSubtitleDocumentId,
+  isFirestoreSubtitlesConfigured,
+  saveSubtitleText,
+} from './firestoreSubtitles';
+import {
+  cloudinaryPublicIdForFilename,
+  isCloudinaryConfigured,
+} from './cloudinaryImages';
 
 
 let assFilterSupport: Promise<boolean> | null = null;
@@ -903,6 +918,65 @@ function buildCompositionFilter(
   )}`;
 }
 
+async function materializeKeyframedComposition(params: {
+  clipId: number;
+  videoPath: string;
+  hasAudio: boolean;
+  duration: number;
+  base: ClipComposition;
+  keyframes: CompositionKeyframe[];
+  width: number;
+  height: number;
+}): Promise<{ videoPath: string; temporaryPaths: string[] }> {
+  const frames = params.keyframes
+    .filter((frame) => frame.time >= 0 && frame.time < params.duration - 0.05)
+    .sort((a, b) => a.time - b.time);
+  if (frames.length === 0) return { videoPath: params.videoPath, temporaryPaths: [] };
+
+  const states: Array<{ start: number; end: number; composition: ClipComposition }> = [];
+  let composition = params.base;
+  let cursor = 0;
+  for (const frame of frames) {
+    if (frame.time > cursor + 0.01) states.push({ start: cursor, end: frame.time, composition });
+    composition = frame.composition;
+    cursor = frame.time;
+  }
+  if (cursor < params.duration) states.push({ start: cursor, end: params.duration, composition });
+
+  const stamp = Date.now();
+  const temporaryPaths: string[] = [];
+  const partPaths: string[] = [];
+  try {
+    for (let index = 0; index < states.length; index++) {
+      const state = states[index];
+      const output = path.join(CLIPS_DIR, `keyframe-${params.clipId}-${stamp}-${index}.mp4`);
+      temporaryPaths.push(output);
+      partPaths.push(output);
+      const filter = `${buildCompositionFilter(state.composition, params.width, params.height)}[keyframed]`;
+      const args = [
+        '-y', '-ss', state.start.toFixed(3), '-t', (state.end - state.start).toFixed(3),
+        '-i', params.videoPath, '-filter_complex', filter, '-map', '[keyframed]',
+      ];
+      if (params.hasAudio) args.push('-map', '0:a?');
+      args.push('-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18', '-threads', '2');
+      if (params.hasAudio) args.push('-c:a', 'aac', '-b:a', '128k'); else args.push('-an');
+      args.push('-pix_fmt', 'yuv420p', output);
+      await runFfmpeg(args, 10 * 60 * 1000);
+    }
+
+    const concatPath = path.join(CLIPS_DIR, `keyframe-${params.clipId}-${stamp}.ffconcat`);
+    const outputPath = path.join(CLIPS_DIR, `keyframe-${params.clipId}-${stamp}-joined.mp4`);
+    temporaryPaths.push(concatPath, outputPath);
+    const quote = (value: string) => value.replace(/'/g, "'\\''");
+    fs.writeFileSync(concatPath, `ffconcat version 1.0\n${partPaths.map((value) => `file '${quote(value)}'`).join('\n')}\n`);
+    await runFfmpeg(['-y', '-f', 'concat', '-safe', '0', '-i', concatPath, '-c', 'copy', outputPath], 10 * 60 * 1000);
+    return { videoPath: outputPath, temporaryPaths };
+  } catch (error) {
+    temporaryPaths.forEach(safeDeleteFile);
+    throw error;
+  }
+}
+
 
 function escapeFilterPath(
   filePath: string
@@ -928,6 +1002,67 @@ function escapeDrawtextText(
     .replace(/\r?\n/g, ' ');
 }
 
+async function materializeTimeline(params: {
+  clip: ClipRecord;
+  videoPath: string;
+  hasAudio: boolean;
+  transcript: TranscriptSegment[];
+}): Promise<{ videoPath: string; transcript: TranscriptSegment[]; duration: number; temporaryPath?: string }> {
+  const timeline = params.clip.timelineSegments?.filter((segment) => segment.end - segment.start >= 0.1) ?? [];
+  const source = timeline.length > 0
+    ? timeline
+    : [{ id: 'base', start: params.clip.startTime, end: params.clip.endTime }];
+  const duration = source.reduce((sum, segment) => sum + (segment.end - segment.start), 0);
+  const hasCompositionKeyframes = Object.values(params.clip.compositionKeyframes ?? {})
+    .some((frames) => Array.isArray(frames) && frames.length > 0);
+  const unchanged = !hasCompositionKeyframes && source.length === 1 &&
+    Math.abs(source[0].start - params.clip.startTime) < 0.001 &&
+    Math.abs(source[0].end - params.clip.endTime) < 0.001;
+  if (unchanged) return { videoPath: params.videoPath, transcript: params.transcript, duration };
+
+  const temporaryPath = path.join(CLIPS_DIR, `timeline-${params.clip.id}-${Date.now()}.mp4`);
+  const args: string[] = ['-y'];
+  for (const segment of source) {
+    args.push('-ss', segment.start.toFixed(3), '-t', (segment.end - segment.start).toFixed(3), '-i', params.videoPath);
+  }
+  const chains: string[] = [];
+  source.forEach((_segment, index) => {
+    chains.push(`[${index}:v]setpts=PTS-STARTPTS[v${index}]`);
+    if (params.hasAudio) chains.push(`[${index}:a]asetpts=PTS-STARTPTS[a${index}]`);
+  });
+  const inputs = source.map((_segment, index) => `[v${index}]${params.hasAudio ? `[a${index}]` : ''}`).join('');
+  chains.push(`${inputs}concat=n=${source.length}:v=1:a=${params.hasAudio ? 1 : 0}[timelinev]${params.hasAudio ? '[timelinea]' : ''}`);
+  args.push('-filter_complex', chains.join(';'), '-map', '[timelinev]');
+  if (params.hasAudio) args.push('-map', '[timelinea]');
+  args.push('-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18', '-threads', '2');
+  if (params.hasAudio) args.push('-c:a', 'aac', '-b:a', '128k');
+  args.push('-movflags', '+faststart', temporaryPath);
+  try {
+    await runFfmpeg(args, 10 * 60 * 1000);
+  } catch (error) {
+    safeDeleteFile(temporaryPath);
+    throw error;
+  }
+
+  let offset = 0;
+  const transcript: TranscriptSegment[] = [];
+  for (const part of source) {
+    for (const segment of params.transcript) {
+      const start = Math.max(segment.start, part.start);
+      const end = Math.min(segment.end, part.end);
+      if (end <= start) continue;
+      transcript.push({
+        ...segment,
+        id: `${segment.id}-${part.id}`,
+        start: offset + start - part.start,
+        end: offset + end - part.start,
+      });
+    }
+    offset += part.end - part.start;
+  }
+  return { videoPath: temporaryPath, transcript, duration, temporaryPath };
+}
+
 
 export async function renderClipWithFfmpeg(params: {
   clip: ClipRecord;
@@ -940,18 +1075,34 @@ export async function renderClipWithFfmpeg(params: {
   srtUrl: string;
   thumbnailUrl: string | null;
   exportedSizeBytes: number;
+  exportedKey?: string;
+  srtKey?: string;
+  thumbnailKey?: string;
+  subtitleDocumentId?: string;
 }> {
   ensureStorageDirs();
 
   const {
-    clip,
-    videoPath,
+    clip: sourceClip,
+    videoPath: sourceVideoPath,
     hasAudio,
-    segments,
+    segments: sourceSegments,
     variant,
   } = params;
 
-  const composition = variant
+  const timeline = await materializeTimeline({
+    clip: sourceClip,
+    videoPath: sourceVideoPath,
+    hasAudio,
+    transcript: sourceSegments,
+  });
+  const clip: ClipRecord = timeline.temporaryPath
+    ? { ...sourceClip, startTime: 0, endTime: timeline.duration }
+    : sourceClip;
+  let videoPath = timeline.videoPath;
+  const segments = timeline.transcript;
+
+  let composition = variant
     ? getClipComposition(clip, variant)
     : null;
 
@@ -965,6 +1116,30 @@ export async function renderClipWithFfmpeg(params: {
     1,
     clip.endTime - clip.startTime
   );
+
+  let keyframeTemporaryPaths: string[] = [];
+  const compositionFrames = variant ? (sourceClip.compositionKeyframes?.[variant] ?? []) : [];
+  if (composition && compositionFrames.length > 0) {
+    const keyframed = await materializeKeyframedComposition({
+      clipId: clip.id,
+      videoPath,
+      hasAudio,
+      duration: clipDuration,
+      base: composition,
+      keyframes: compositionFrames,
+      width,
+      height,
+    });
+    videoPath = keyframed.videoPath;
+    keyframeTemporaryPaths = keyframed.temporaryPaths;
+    composition = {
+      ...composition,
+      layout: 'focus',
+      focus: 'content',
+      cameraEnabled: false,
+      content: { x: 0, y: 0, width: 100, height: 100 },
+    };
+  }
 
   const stamp = Date.now();
   const variantTag = variant ? `-${variant}` : '';
@@ -1331,6 +1506,8 @@ export async function renderClipWithFfmpeg(params: {
     safeDeleteFile(mp4Path);
     throw error;
   } finally {
+    if (timeline.temporaryPath) safeDeleteFile(timeline.temporaryPath);
+    keyframeTemporaryPaths.forEach(safeDeleteFile);
     if (fs.existsSync(assPath)) {
       fs.unlinkSync(assPath);
     }
@@ -1360,11 +1537,66 @@ export async function renderClipWithFfmpeg(params: {
     Math.min(1.5, clipDuration / 2)
   );
 
+  const resolvedVariant: CompositionVariant = variant ?? (aspectRatio === '16:9' ? 'horizontal' : 'vertical');
+  const subtitleDocumentId = clipSubtitleDocumentId(clip.id, resolvedVariant);
+  let remoteSrtUrl: string | null = null;
+  if (isFirestoreSubtitlesConfigured()) {
+    await saveSubtitleText({
+      documentId: subtitleDocumentId,
+      clipId: clip.id,
+      videoId: clip.videoId,
+      variant: resolvedVariant,
+      language: 'auto',
+      srtText: await fs.promises.readFile(srtPath, 'utf8'),
+    });
+    remoteSrtUrl = `/api/subtitles/${encodeURIComponent(subtitleDocumentId)}`;
+    safeDeleteFile(srtPath);
+  }
+
+  const thumbnailKey = isCloudinaryConfigured()
+    ? cloudinaryPublicIdForFilename(thumbName)
+    : objectKeyFromUrl(thumbnailUrl) ?? undefined;
+
+  if (isObjectStorageConfigured()) {
+    const exportedKey = `clips/${mp4Name}`;
+    const srtKey = remoteSrtUrl ? undefined : `subtitles/${srtName}`;
+    try {
+      const exportedUrl = await uploadLocalFileToObjectStorage({
+        filePath: mp4Path,
+        key: exportedKey,
+        contentType: 'video/mp4',
+      });
+      const srtUrl = remoteSrtUrl ?? await uploadLocalFileToObjectStorage({
+        filePath: srtPath,
+        key: srtKey!,
+        contentType: 'application/x-subrip; charset=utf-8',
+      });
+      safeDeleteFile(mp4Path);
+      safeDeleteFile(srtPath);
+      return {
+        exportedUrl,
+        srtUrl,
+        thumbnailUrl,
+        exportedSizeBytes: stat.size,
+        exportedKey,
+        srtKey,
+        thumbnailKey,
+        subtitleDocumentId: remoteSrtUrl ? subtitleDocumentId : undefined,
+      };
+    } catch (error) {
+      safeDeleteFile(mp4Path);
+      safeDeleteFile(srtPath);
+      throw error;
+    }
+  }
+
   return {
     exportedUrl: `/storage/clips/${mp4Name}`,
-    srtUrl: `/storage/clips/${srtName}`,
+    srtUrl: remoteSrtUrl ?? `/storage/clips/${srtName}`,
     thumbnailUrl,
     exportedSizeBytes: stat.size,
+    thumbnailKey,
+    subtitleDocumentId: remoteSrtUrl ? subtitleDocumentId : undefined,
   };
 }
 

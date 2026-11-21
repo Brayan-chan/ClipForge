@@ -66,3 +66,88 @@ test('does not end while the final thought is grammatically open', () => {
   assert.ok(!result[0].transcriptExcerpt.endsWith('todavía'));
 });
 
+test('honors the requested clip limit and never exceeds ten', () => {
+  const segments = Array.from({ length: 30 }, (_, index) => {
+    const start = index * 4;
+    const texts = [
+      'Voy a intentar este salto imposible, atentos.',
+      '¡No puede ser, casi se ha caído!',
+      'Pero al final lo consiguió y esa es la razón.',
+    ];
+    return segment(index + 1, start, start + 3.5, texts[index % texts.length]);
+  });
+  const five = detectNarrativeMoments({
+    segments,
+    config: DEFAULT_SCORING_CONFIG,
+    sceneTimestamps: [5, 29, 53, 77, 101],
+    audio: { energyPeaks: [5, 29, 53, 77, 101], silenceEnds: [], available: true },
+    maxClips: 5,
+  });
+  const clamped = detectNarrativeMoments({
+    segments,
+    config: DEFAULT_SCORING_CONFIG,
+    sceneTimestamps: [5, 29, 53, 77, 101],
+    audio: { energyPeaks: [5, 29, 53, 77, 101], silenceEnds: [], available: true },
+    maxClips: 99,
+  });
+  assert.ok(five.length <= 5);
+  assert.ok(clamped.length <= 10);
+});
+
+test('can rank a strong opinion without requiring a loud reaction keyword', () => {
+  const segments = [
+    segment(1, 0, 4, 'Para mí, este es el peor sistema para aprender a conducir.'),
+    segment(2, 4.1, 8, 'El problema es que castiga justo cuando intentas mejorar.'),
+    segment(3, 8.1, 12, 'Pero resulta que cambiar una sola regla transforma la carrera.'),
+    segment(4, 12.1, 16, 'Al final funciona mejor y esa es la razón.'),
+  ];
+  const result = detectNarrativeMoments({
+    segments,
+    config: DEFAULT_SCORING_CONFIG,
+    sceneTimestamps: [],
+    audio: noAudio,
+    maxClips: 5,
+  });
+  assert.ok(result.length >= 1);
+  assert.ok(['Opinión', 'Conflicto'].includes(result[0].hookType));
+});
+
+test('uses audiovisual change as the event and recovers context before a restrained reaction', () => {
+  const segments = [
+    segment(1, 0, 4, 'Estoy entrando a la siguiente zona y voy a probar otra ruta.'),
+    segment(2, 4.1, 8, 'Tengo que mantener el coche dentro de esta parte del circuito.'),
+    segment(3, 8.1, 12, 'Ahora viene la curva que estaba preparando desde antes.'),
+    segment(4, 12.1, 16, 'Ha ocurrido justo aquí.'),
+    segment(5, 16.1, 20, 'Vale, ya entiendo lo que cambió y podemos continuar.'),
+  ];
+  const result = detectNarrativeMoments({
+    segments,
+    config: DEFAULT_SCORING_CONFIG,
+    sceneTimestamps: [13],
+    audio: { energyPeaks: [13.2], silenceEnds: [], available: true },
+    maxClips: 5,
+  });
+  assert.ok(result.length >= 1);
+  assert.ok(result[0].startTime <= 4.1, `expected context before event, got ${result[0].startTime}`);
+  assert.ok(result[0].endTime >= 20);
+  assert.match(result[0].reason, /visual change|energy peak/);
+});
+
+test('does not claim heuristic certainty or award 100 to generated clips', () => {
+  const segments = [
+    'Os voy a enseñar algo que no esperaba nadie.',
+    'Mira cómo cambia todo justo en este momento.',
+    'No puede ser, esto es increíble.',
+    'Al final conseguimos terminarlo y salió bien.',
+  ].map((text, index) => segment(index + 1, index * 4, index * 4 + 3.5, text));
+  const clips = detectNarrativeMoments({
+    segments,
+    config: DEFAULT_SCORING_CONFIG,
+    sceneTimestamps: [4, 8, 12],
+    audio: { available: true, energyPeaks: [8, 10], silenceEnds: [15] },
+    maxClips: 5,
+  });
+  assert.ok(clips.length > 0);
+  assert.ok(clips.every((clip) => clip.score <= 96));
+});
+
