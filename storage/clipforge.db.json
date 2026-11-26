@@ -15,10 +15,139 @@
       "createdAt": "2026-11-18T19:17:25.683Z"
     }
   ],
-  "videos": [],
+  "videos": [
+    {
+      "id": 37,
+      "projectId": 1,
+      "title": "hf_20261121_053223_20865178-c1aa-4e7b-95d1-224326fd92f2",
+      "filename": "1795243373353-06574631-f025-4474-985b-a277656a7409.mp4",
+      "originalName": "hf_20261121_053223_20865178-c1aa-4e7b-95d1-224326fd92f2.mp4",
+      "fileUrl": "/api/media/uploads/1795243373353-06574631-f025-4474-985b-a277656a7409.mp4",
+      "sourceUrl": "r2://uploads/1795243373353-06574631-f025-4474-985b-a277656a7409.mp4",
+      "storageKey": "uploads/1795243373353-06574631-f025-4474-985b-a277656a7409.mp4",
+      "sourceType": "url",
+      "thumbnailUrl": "https://res.cloudinary.com/dpyi9zz7k/image/upload/v1795243375/clipforge/thumbnails/video-37-cover.jpg",
+      "duration": 15.07,
+      "width": 720,
+      "height": 1280,
+      "fps": 24,
+      "hasAudio": true,
+      "sizeBytes": 2780188,
+      "status": "ready",
+      "createdAt": "2026-11-21T06:42:55.331Z"
+    }
+  ],
   "transcriptions": [],
-  "clips": [],
-  "processingJobs": [],
+  "clips": [
+    {
+      "id": 102,
+      "videoId": 37,
+      "title": "hf_20261121_053223_20865178-c1aa-4e7b-95d1-224326fd92f2",
+      "hookText": "",
+      "hookType": "manual-import",
+      "contextStatus": "self-contained",
+      "sceneChanges": 0,
+      "startTime": 0,
+      "endTime": 15.07,
+      "score": 0,
+      "breakdown": {
+        "hook": 0,
+        "infoValue": 0,
+        "emotion": 0,
+        "selfContained": 0,
+        "durationFit": 0
+      },
+      "reason": "Imported directly for formatting and editing.",
+      "scoringSource": "manual",
+      "status": "approved",
+      "aspectRatio": "9:16",
+      "framingMode": "crop",
+      "cropX": 50,
+      "cropY": 50,
+      "zoom": 1,
+      "compositions": {
+        "vertical": {
+          "aspectRatio": "9:16",
+          "layout": "stacked",
+          "focus": "split",
+          "cameraEnabled": true,
+          "camera": {
+            "x": 2,
+            "y": 57,
+            "width": 28,
+            "height": 40
+          },
+          "content": {
+            "x": 0,
+            "y": 0,
+            "width": 100,
+            "height": 100
+          },
+          "cameraPosition": "top",
+          "cameraScale": 32,
+          "creditEnabled": false,
+          "creditText": ""
+        },
+        "horizontal": {
+          "aspectRatio": "16:9",
+          "layout": "focus",
+          "focus": "content",
+          "cameraEnabled": false,
+          "camera": {
+            "x": 2,
+            "y": 57,
+            "width": 28,
+            "height": 40
+          },
+          "content": {
+            "x": 0,
+            "y": 0,
+            "width": 100,
+            "height": 100
+          },
+          "cameraPosition": "top",
+          "cameraScale": 32,
+          "creditEnabled": false,
+          "creditText": ""
+        }
+      },
+      "exportVariants": {},
+      "subtitleStyle": {
+        "enabled": false,
+        "preset": "hormozi",
+        "fontSize": 22,
+        "textColor": "#FFFFFF",
+        "highlightColor": "#22C55E",
+        "position": "bottom",
+        "alignment": "center",
+        "backgroundBox": true,
+        "region": {
+          "x": 8,
+          "y": 72,
+          "width": 84,
+          "height": 20
+        }
+      },
+      "exportedUrl": null,
+      "srtUrl": null,
+      "thumbnailUrl": "https://res.cloudinary.com/dpyi9zz7k/image/upload/v1795243375/clipforge/thumbnails/video-37-cover.jpg",
+      "createdAt": "2026-11-21T06:42:57.046Z"
+    }
+  ],
+  "processingJobs": [
+    {
+      "id": 39,
+      "projectId": 1,
+      "videoId": 37,
+      "stage": "completed",
+      "progress": 100,
+      "message": "Video imported for editing. One full-length clip is ready in Clip Studio.",
+      "useAi": false,
+      "editorOnly": true,
+      "requestedClipCount": 5,
+      "updatedAt": "2026-11-21T06:42:57.047Z"
+    }
+  ],
   "scoringConfig": {
     "hookWeight": 25,
     "infoWeight": 25,
@@ -32,9 +161,9 @@
   "nextIds": {
     "user": 2,
     "project": 2,
-    "video": 36,
+    "video": 38,
     "transcription": 31,
-    "clip": 101,
-    "job": 38
+    "clip": 103,
+    "job": 40
   }
 }
